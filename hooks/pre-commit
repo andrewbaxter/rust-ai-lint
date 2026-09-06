@@ -8,4 +8,13 @@
 # is a hook that will be told to skip a check.
 set -e
 root=$(git rev-parse --show-toplevel)
+
+# The nix build wraps the binary with the standard library sources the usage check needs,
+# so it works with nothing set up in the environment. A cached rebuild is under a second.
+if command -v nix-build > /dev/null 2>&1; then
+    exec "$(nix-build --no-out-link "$root/lint")/bin/schemask-lint" --root "$root" --staged
+fi
+
+# Without nix the sources have to come from somewhere else: `rustup component add rust-src`
+# or RUST_SRC_PATH. The usage check will say so if it can't find them.
 exec cargo run --quiet --release --manifest-path "$root/lint/Cargo.toml" -- --root "$root" --staged
