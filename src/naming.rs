@@ -1,8 +1,5 @@
 use {
-    crate::{
-        Problem,
-        Source,
-    },
+    crate::Problem,
     syn::visit::Visit,
 };
 
@@ -17,9 +14,9 @@ fn is_upper_camel(name: &str) -> bool {
     return name.chars().next().map(|c| !c.is_lowercase()).unwrap_or(true);
 }
 
-struct Checker<'a> {
-    path: &'a str,
-    problems: &'a mut Vec<Problem>,
+pub struct Checker<'a> {
+    pub path: &'a str,
+    pub problems: &'a mut Vec<Problem>,
 }
 
 impl<'a> Checker<'a> {
@@ -149,27 +146,5 @@ impl<'ast, 'a> Visit<'ast> for Checker<'a> {
             self.snake(&i.ident, "binding");
         }
         syn::visit::visit_pat_ident(self, i);
-    }
-}
-
-pub fn check(sources: &[Source], problems: &mut Vec<Problem>) {
-    for source in sources {
-        let file = match syn::parse_file(&source.text) {
-            Ok(f) => f,
-            Err(e) => {
-                problems.push(Problem {
-                    check: "naming",
-                    path: source.path.clone(),
-                    line: e.span().start().line,
-                    message: format!("parse failed: {}", e),
-                });
-                continue;
-            },
-        };
-        let mut checker = Checker {
-            path: &source.path,
-            problems: problems,
-        };
-        checker.visit_file(&file);
     }
 }

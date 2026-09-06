@@ -1,17 +1,14 @@
 use {
-    crate::{
-        Problem,
-        Source,
-    },
+    crate::Problem,
     syn::{
         spanned::Spanned,
         visit::Visit,
     },
 };
 
-struct Checker<'a> {
-    path: &'a str,
-    problems: &'a mut Vec<Problem>,
+pub struct Checker<'a> {
+    pub path: &'a str,
+    pub problems: &'a mut Vec<Problem>,
 }
 
 impl<'ast, 'a> Visit<'ast> for Checker<'a> {
@@ -43,19 +40,5 @@ impl<'ast, 'a> Visit<'ast> for Checker<'a> {
             });
         }
         syn::visit::visit_attribute(self, i);
-    }
-}
-
-pub fn check(sources: &[Source], problems: &mut Vec<Problem>) {
-    for source in sources {
-        let file = match syn::parse_file(&source.text) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let mut checker = Checker {
-            path: &source.path,
-            problems: problems,
-        };
-        checker.visit_file(&file);
     }
 }
