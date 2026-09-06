@@ -1,0 +1,11 @@
+#!/bin/sh
+# Checks the staged content -- not the working tree -- against the repo's conventions.
+# Install with:
+#
+#   ln -sf ../../lint/hooks/pre-commit .git/hooks/pre-commit
+#
+# There is deliberately no way to pass arguments: a hook that can be told to skip a check
+# is a hook that will be told to skip a check.
+set -e
+root=$(git rev-parse --show-toplevel)
+exec cargo run --quiet --release --manifest-path "$root/lint/Cargo.toml" -- --root "$root" --staged
