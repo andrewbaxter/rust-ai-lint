@@ -1,0 +1,6 @@
+# The linter links against the compiler's own internals, so it is pinned to one
+# nightly. Nix supplies this toolchain for the real build; this file is what a
+# plain `cargo build` in a checkout uses.
+[toolchain]
+channel = "nightly-2026-09-08"
+components = ["rustc-dev", "llvm-tools", "rust-src"]

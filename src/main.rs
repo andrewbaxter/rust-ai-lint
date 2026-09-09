@@ -1,124 +1,92 @@
+#![feature(rustc_private)]
+
+mod collect;
+mod driver;
+mod style;
+mod wire;
+
+extern crate rustc_ast;
+extern crate rustc_driver;
+extern crate rustc_hir;
+extern crate rustc_interface;
+extern crate rustc_middle;
+extern crate rustc_session;
+extern crate rustc_span;
+
 use {
-    ra_ap_hir::{
-        Crate,
-        HasAttrs,
-        HasVisibility,
-        ModuleDef,
-        Semantics,
-        Visibility,
+    crate::wire::{
+        Comment,
+        Def,
+        OUT_DIR_ENV,
+        Problem,
+        Report,
+        Use,
     },
-    ra_ap_ide_db::defs::Definition,
-    ra_ap_load_cargo::{
-        LoadCargoConfig,
-        ProcMacroServerChoice,
-        load_workspace_at,
-    },
-    ra_ap_paths::AbsPathBuf,
-    ra_ap_syntax::AstNode,
-    ra_ap_project_model::{
-        CargoConfig,
-        RustLibSource,
-    },
-    genemichaels_lib::{
-        FormatConfig,
-        format_str,
-    },
-    syn::visit::Visit,
     std::{
         collections::{
+            BTreeMap,
+            BTreeSet,
             HashMap,
-            HashSet,
         },
+        ffi::OsStr,
         path::{
             Path,
             PathBuf,
         },
-        process::exit,
+        process::{
+            Command,
+            exit,
+        },
     },
 };
 
-mod comments;
-mod git;
-mod naming;
-mod returns;
-mod shorthand;
-mod suppressions;
-mod usage;
-
-pub struct Source {
-    pub path: String,
-    pub text: String,
+fn cargo() -> PathBuf {
+    return std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
 }
 
-pub struct Problem {
-    pub check: &'static str,
-    pub path: String,
-    pub line: usize,
-    pub message: String,
-}
-
-const CHECKS: &[&str] = &["format", "comments", "naming", "returns", "shorthand", "suppressions", "usage"];
-
-enum Mode {
-    Staged,
-    Worktree,
-    Commit(String),
-}
-
-fn usage_text() -> String {
-    return [
-        "Usage: schemask-lint [options]",
-        "",
-        "Modes (default --staged):",
-        "  --staged            check the git index against HEAD (for a pre-commit hook)",
-        "  --worktree          check files on disk against HEAD",
-        "  --commit <rev>      check an existing commit against its parent",
-        "",
-        "Options:",
-        "  --root <dir>        repository to check (default: current directory)",
-        "  --cargo <dir>       cargo workspace for the usage check, repeatable (default: all in repo)",
-        "  --only <check>      run only these checks (repeatable); does not affect the hook",
-        "  --rust-src <dir>    standard library sources (the dir holding core/ and std/)",
-        "  -h, --help          this message",
-        "",
-        "Checks: format, comments, naming, returns, shorthand, suppressions, usage",
-    ].join("\n");
-}
-
-fn parsed(
-    sources: &[Source],
-    report_parse_errors: bool,
-    check: &'static str,
-    problems: &mut Vec<Problem>,
-    mut visit: impl FnMut(&str, &syn::File, &mut Vec<Problem>),
-) {
-    for source in sources {
-        let file = match syn::parse_file(&source.text) {
-            Ok(f) => f,
-            Err(e) => {
-                if report_parse_errors {
-                    problems.push(Problem {
-                        check: check,
-                        path: source.path.clone(),
-                        line: e.span().start().line,
-                        message: format!("parse failed: {}", e),
-                    });
-                }
-                continue;
-            },
-        };
-        visit(&source.path, &file, problems);
+/// Cargo skips crates whose sources haven't changed, and a skipped crate reports
+/// nothing at all - which would read as "this crate has no code in it". Throwing
+/// away what cargo built for the workspace's own crates makes every run see the
+/// whole workspace; dependencies keep their cache, which is most of the time.
+///
+/// Cargo has moved this directory around between releases, so rather than knowing
+/// the layout, look for anything named after a member crate.
+fn clear_members(dir: &Path, members: &BTreeSet<String>, depth: usize) {
+    if depth > 4 {
+        return;
     }
-}
-
-fn collect_cargo_roots(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
-    let manifest = dir.join("Cargo.toml");
-    if manifest.exists() &&
-        std::fs::read_to_string(&manifest).map(|t| t.contains("[workspace]")).unwrap_or(false) {
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let stem = name.rsplit_once('-').map(|(before, _)| before.to_string()).unwrap_or_else(|| name.clone());
+        let named_after_member = [&name, &stem].into_iter().any(|candidate| {
+            let underscored = candidate.replace('-', "_");
+            return members.iter().any(|member| {
+                return member == candidate || member.replace('-', "_") == underscored;
+            });
+        });
+        if named_after_member {
+            let _ = std::fs::remove_dir_all(&path);
+            continue;
+        }
+        clear_members(&path, members, depth + 1);
+    }
+}
+
+/// Every directory holding a manifest, skipping build output and anything hidden.
+fn find_manifests(dir: &Path, found: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    if dir.join("Cargo.toml").is_file() {
         found.push(dir.to_path_buf());
     }
     for entry in entries.flatten() {
@@ -128,525 +96,227 @@ fn collect_cargo_roots(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == "target" || name == ".git" || name.starts_with('.') {
+        if name == "target" || name.starts_with('.') {
             continue;
         }
-        collect_cargo_roots(&path, found);
+        find_manifests(&path, found);
     }
 }
 
+/// Two roles share one binary. Cargo runs it as a compiler wrapper, with the real
+/// rustc as the first argument and our output directory in the environment;
+/// anything else is a person running the checker.
 fn main() {
+    let wrapping = std::env::var_os(OUT_DIR_ENV).is_some() && std::env::args_os().count() > 1;
+    if wrapping {
+        let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+        // The checker doesn't live in the toolchain, so rustc can't work out where the
+        // standard library is from our own path; the real compiler cargo handed us knows.
+        if !args.iter().any(|a| a == "--sysroot" || a.starts_with("--sysroot=")) {
+            let found =
+                Command::new(&args[0]).args(["--print", "sysroot"]).output().ok().filter(|o| o.status.success());
+            if let Some(out) = found {
+                args.push("--sysroot".to_string());
+                args.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            }
+        }
+        rustc_driver::run_compiler(&args, &mut driver::Callbacks);
+        return;
+    }
+    if std::env::args_os().count() > 1 {
+        eprintln!(
+            "rust-ai-lint takes no arguments: it checks every cargo project under the current directory, and every check it knows."
+        );
+        exit(2);
+    }
+
+    // Checks every cargo project under the current directory, then reports what it
+    // found. Nothing here is optional and nothing is advisory: a non-empty report
+    // means the tree is not acceptable.
     match (|| -> Result<i32, String> {
-        let mut mode = Mode::Staged;
-        let mut root = None;
-        let mut cargo: Vec<PathBuf> = vec![];
-        let mut only: HashSet<String> = HashSet::new();
-        let mut rust_src = None;
-        let mut argv = std::env::args().skip(1);
-        while let Some(arg) = argv.next() {
-            let mut value = || -> Result<String, String> {
-                return argv.next().ok_or_else(|| format!("{} needs a value", arg));
-            };
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    println!("{}", usage_text());
-                    exit(0);
-                },
-                "--staged" => mode = Mode::Staged,
-                "--worktree" => mode = Mode::Worktree,
-                "--commit" => mode = Mode::Commit(value()?),
-                "--root" => root = Some(PathBuf::from(value()?)),
-                "--cargo" => cargo.push(PathBuf::from(value()?)),
-                "--only" => {
-                    only.insert(value()?);
-                },
-                "--rust-src" => rust_src = Some(PathBuf::from(value()?)),
-                other => return Err(format!("unrecognized argument `{}`\n\n{}", other, usage_text())),
-            }
+        let root = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {}", e))?;
+        let mut manifests = vec![];
+        find_manifests(&root, &mut manifests);
+        if manifests.is_empty() {
+            return Err(format!("no cargo project found under {}", root.display()));
         }
-        for name in only.iter() {
-            if !CHECKS.contains(&name.as_str()) {
-                return Err(format!("unknown check `{}`; known checks: {}", name, CHECKS.join(", ")));
-            }
-        }
-        let enabled: HashSet<String> =
-            CHECKS.iter().map(|c| c.to_string()).filter(|c| only.is_empty() || only.contains(c)).collect();
-        let from = root.unwrap_or_else(|| PathBuf::from("."));
-        let from = from.as_path();
-        let root = (|| -> Result<PathBuf, String> {
+
+        // Ask cargo which workspace each manifest belongs to, so that a workspace with
+        // many member crates is checked once rather than once per member.
+        let mut workspaces: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for manifest in manifests {
             let out =
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(from)
-                    .args(["rev-parse", "--show-toplevel"])
+                Command::new(cargo())
+                    .current_dir(&manifest)
+                    .args(["metadata", "--no-deps", "--format-version=1"])
                     .output()
-                    .map_err(|e| format!("failed to run git: {}", e))?;
+                    .map_err(|e| format!("failed to run cargo metadata in {}: {}", manifest.display(), e))?;
             if !out.status.success() {
-                return Err("not inside a git repository".to_string());
+                return Err(
+                    format!(
+                        "cargo metadata failed in {}: {}",
+                        manifest.display(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                );
             }
-            return Ok(std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
-        })()?;
-        let (old, new) = match &mode {
-            Mode::Staged => {
-                let old = if git::rev_exists(&root, "HEAD") {
-                    git::tree_sources(&root, "HEAD")?
-                } else {
-                    vec![]
-                };
-                (old, (|| -> Result<Vec<Source>, String> {
-                    let listing = git::run(&root, &["ls-files", "--cached"])?;
-                    let mut out = vec![];
-                    for path in listing.lines() {
-                        if !git::is_rust(path) {
-                            continue;
-                        }
-                        let text = match git::run(&root, &["show", &format!(":{}", path)]) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        out.push(Source {
-                            path: path.to_string(),
-                            text: text,
-                        });
-                    }
-                    return Ok(out);
-                })()?)
-            },
-            Mode::Worktree => {
-                let old = if git::rev_exists(&root, "HEAD") {
-                    git::tree_sources(&root, "HEAD")?
-                } else {
-                    vec![]
-                };
-                (old, (|| -> Result<Vec<Source>, String> {
-                    let listing = git::run(&root, &["ls-files", "--cached"])?;
-                    let mut out = vec![];
-                    for path in listing.lines() {
-                        if !git::is_rust(path) {
-                            continue;
-                        }
-                        let text = match std::fs::read_to_string(root.join(path)) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        out.push(Source {
-                            path: path.to_string(),
-                            text: text,
-                        });
-                    }
-                    return Ok(out);
-                })()?)
-            },
-            Mode::Commit(rev) => {
-                let parent = format!("{}^", rev);
-                let old = if git::rev_exists(&root, &parent) {
-                    git::tree_sources(&root, &parent)?
-                } else {
-                    vec![]
-                };
-                (old, git::tree_sources(&root, rev)?)
-            },
-        };
-        let mut problems = vec![];
-        if enabled.contains("format") {
-            let config = (|| -> Result<FormatConfig, String> {
-                let mut at = Some(root.as_path());
-                while let Some(dir) = at {
-                    for name in [".genemichaels.json", "genemichaels.json"] {
-                        let candidate = dir.join(name);
-                        if !candidate.exists() {
-                            continue;
-                        }
-                        let text =
-                            std::fs::read_to_string(
-                                &candidate,
-                            ).map_err(|e| format!("reading {}: {}", candidate.display(), e))?;
-                        return serde_json::from_str(
-                            &text,
-                        ).map_err(|e| format!("parsing {}: {}", candidate.display(), e));
-                    }
-                    at = dir.parent();
-                }
-                return Ok(FormatConfig::default());
-            })()?;
-            for source in &new {
-                let res = match format_str(&source.text, &config) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        problems.push(Problem {
-                            check: "format",
-                            path: source.path.clone(),
-                            line: 1,
-                            message: format!("could not be formatted: {}", e),
-                        });
-                        continue;
-                    },
-                };
-                if !res.lost_comments.is_empty() {
-                    problems.push(Problem {
-                        check: "format",
-                        path: source.path.clone(),
-                        line: 1,
-                        message: format!(
-                            "genemichaels lost {} comment(s) formatting this file",
-                            res.lost_comments.len()
-                        ),
-                    });
+            let meta: serde_json::Value =
+                serde_json::from_slice(
+                    &out.stdout,
+                ).map_err(|e| format!("cargo metadata in {} is not json: {}", manifest.display(), e))?;
+            let workspace_root =
+                meta
+                    .get("workspace_root")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("cargo metadata in {} has no workspace_root", manifest.display()))?;
+            let mut members = BTreeSet::new();
+            for package in meta.get("packages").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+                let Some(name) = package.get("name").and_then(|v| v.as_str()) else {
                     continue;
-                }
-                if res.rendered != source.text {
-                    problems.push(Problem {
-                        check: "format",
-                        path: source.path.clone(),
-                        line: source
-                            .text
-                            .lines()
-                            .zip(res.rendered.lines())
-                            .position(|(a, b)| a != b)
-                            .map(|i| i + 1)
-                            .unwrap_or_else(|| source.text.lines().count().min(res.rendered.lines().count()) + 1),
-                        message: "not genemichaels-formatted; run `genemichaels` on this file".to_string(),
-                    });
-                }
+                };
+                members.insert(name.to_string());
+            }
+            workspaces.insert(PathBuf::from(workspace_root), members);
+        }
+
+        // Each crate the compiler wrapper sees writes what it found here.
+        let out_dir = root.join("target").join("rust-ai-lint-reports");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).map_err(|e| format!("cannot create {}: {}", out_dir.display(), e))?;
+        let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {}", e))?;
+        for (workspace_root, members) in &workspaces {
+            let target = workspace_root.join("target").join("rust-ai-lint");
+            clear_members(&target, members, 0);
+            let status =
+                Command::new(cargo())
+                    .current_dir(workspace_root)
+                    .args(["check", "--workspace", "--all-targets", "--quiet"])
+                    .env("RUSTC_WORKSPACE_WRAPPER", &exe)
+                    .env("CARGO_TARGET_DIR", &target)
+                    .env(OUT_DIR_ENV, &out_dir)
+                    .status()
+                    .map_err(|e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e))?;
+            if !status.success() {
+                return Err(
+                    format!(
+                        "{} does not compile, so it cannot be checked; fix the build errors above first",
+                        workspace_root.display()
+                    ),
+                );
             }
         }
-        if enabled.contains("comments") {
-            if !old.is_empty() {
-                let (old_counts, _, _) = comments::tally(&old);
-                let (new_counts, new_found, errors) = comments::tally(&new);
-                for e in errors {
-                    problems.push(Problem {
-                        check: "comments",
-                        path: "".to_string(),
-                        line: 1,
-                        message: e,
-                    });
-                }
-                let mut reported: Vec<(&comments::Key, usize, usize)> = vec![];
-                for (key, new_count) in &new_counts {
-                    let old_count = old_counts.get(key).copied().unwrap_or(0);
-                    if *new_count > old_count {
-                        reported.push((key, old_count, *new_count));
-                    }
-                }
-                reported.sort_by(|a, b| a.0.text.cmp(&b.0.text));
-                for (key, old_count, new_count) in reported {
-                    let where_ = new_found.get(key);
-                    let verb = if old_count == 0 {
-                        "added"
-                    } else {
-                        "duplicated"
-                    };
-                    const LIMIT: usize = 70;
-                    let text = if key.text.chars().count() <= LIMIT {
-                        key.text.clone()
-                    } else {
-                        format!("{}...", key.text.chars().take(LIMIT).collect::<String>())
-                    };
-                    problems.push(Problem {
-                        check: "comments",
-                        path: where_.map(|f| f.path.clone()).unwrap_or_default(),
-                        line: where_.map(|f| f.line).unwrap_or(1),
-                        message: format!(
-                            "{} {} (appeared {} time(s) before, {} now): {}",
-                            verb,
-                            key.kind,
-                            old_count,
-                            new_count,
-                            text
-                        ),
-                    });
-                }
+        let mut problems: Vec<Problem> = vec![];
+        let mut defs: Vec<Def> = vec![];
+        let mut uses: Vec<Use> = vec![];
+        let mut comments: Vec<Comment> = vec![];
+        let entries = std::fs::read_dir(&out_dir).map_err(|e| format!("cannot read {}: {}", out_dir.display(), e))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+            let report: Report =
+                serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {}", path.display(), e))?;
+            problems.extend(report.problems);
+            defs.extend(report.defs);
+            uses.extend(report.uses);
+            comments.extend(report.comments);
+        }
+        let _ = std::fs::remove_dir_all(&out_dir);
+        if defs.is_empty() {
+            return Err(
+                format!(
+                    "no crate reported anything, which means cargo reused old build output; remove {} and try again",
+                    root.join("target").join("rust-ai-lint").display()
+                ),
+            );
+        }
+
+        // A def is dead if nothing names it, and asks to be dissolved if exactly one
+        // hand-written name refers to it. Names a macro produced keep a def alive but
+        // can't be rewritten, so they never ask for inlining.
+        let mut sites: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for use_ in uses {
+            sites.entry(use_.key.clone()).or_default().insert(use_.site.clone());
+            if !use_.generated {
+                written.entry(use_.key).or_default().insert(use_.site);
             }
         }
-        if enabled.contains("naming") {
-            parsed(&new, true, "naming", &mut problems, |path, file, problems| {
-                let mut checker = naming::Checker {
-                    path: path,
-                    problems: problems,
-                };
-                checker.visit_file(file);
-            });
-        }
-        if enabled.contains("returns") {
-            parsed(&new, false, "returns", &mut problems, |path, file, problems| {
-                let mut checker = returns::Checker {
-                    path: path,
-                    problems: problems,
-                };
-                checker.visit_file(file);
-            });
-        }
-        if enabled.contains("shorthand") {
-            parsed(&new, false, "shorthand", &mut problems, |path, file, problems| {
-                let mut checker = shorthand::Checker {
-                    path: path,
-                    problems: problems,
-                };
-                checker.visit_file(file);
-            });
-        }
-        if enabled.contains("suppressions") {
-            parsed(&new, false, "suppressions", &mut problems, |path, file, problems| {
-                let mut checker = suppressions::Checker {
-                    path: path,
-                    problems: problems,
-                };
-                checker.visit_file(file);
-            });
-        }
-        if enabled.contains("usage") {
-            let roots = if cargo.is_empty() {
-                let mut found = vec![];
-                collect_cargo_roots(&root, &mut found);
-                if found.is_empty() && root.join("Cargo.toml").exists() {
-                    found.push(root.clone());
-                }
-                found.sort();
-                found
+        let mut judged = BTreeSet::new();
+        for def in defs {
+            if def.exempt {
+                continue;
+            }
+            if !judged.insert(def.key.clone()) {
+                continue;
+            }
+            let total = sites.get(&def.key).map(|s| s.len()).unwrap_or(0);
+            let by_hand = written.get(&def.key).map(|s| s.len()).unwrap_or(0);
+            let message;
+            if total == 0 {
+                message = format!("{} `{}` is never used; delete it", def.kind, def.name);
+            } else if def.inlinable && total == 1 && by_hand == 1 {
+                message = format!("{} `{}` is used exactly once; inline it into its one caller", def.kind, def.name);
             } else {
-                cargo
+                continue;
+            }
+            problems.push(Problem {
+                check: "usage".to_string(),
+                path: def.path,
+                line: def.line,
+                message: message,
+            });
+        }
+
+        // Prose is written once. The same sentence in two places is a sign it was
+        // generated rather than thought about, so every copy is reported.
+        let mut by_text: BTreeMap<(String, String), Vec<Comment>> = BTreeMap::new();
+        for comment in comments {
+            if comment.kind == "directive" {
+                continue;
+            }
+            by_text.entry((comment.kind.clone(), comment.text.clone())).or_default().push(comment);
+        }
+        for ((kind, text), mut group) in by_text {
+            group.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+            group.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+            if group.len() < 2 {
+                continue;
+            }
+            const LIMIT: usize = 70;
+            let shown = if text.chars().count() <= LIMIT {
+                text.clone()
+            } else {
+                format!("{}...", text.chars().take(LIMIT).collect::<String>())
             };
-            if roots.is_empty() {
-                return Err("no cargo workspace found for the usage check".to_string());
-            }
-            for cargo_root in roots {
-                let cargo_root = cargo_root.as_path();
-                let found_src = (|| -> Option<std::path::PathBuf> {
-                    if let Some(dir) = rust_src.as_deref() {
-                        if usage::is_library_dir(dir) {
-                            return Some(dir.to_path_buf());
-                        }
-                        return None;
-                    }
-                    if let Ok(dir) = std::env::var("RUST_SRC_PATH") {
-                        let dir = std::path::PathBuf::from(dir);
-                        if usage::is_library_dir(&dir) {
-                            return Some(dir);
-                        }
-                    }
-                    let out = match std::process::Command::new("rustc").arg("--print").arg("sysroot").output() {
-                        Ok(o) => o,
-                        Err(_) => return None,
-                    };
-                    if !out.status.success() {
-                        return None;
-                    }
-                    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    let dir = Path::new(&sysroot).join("lib/rustlib/src/rust/library");
-                    if usage::is_library_dir(&dir) {
-                        return Some(dir);
-                    }
-                    return None;
-                })();
-                let Some(rust_src) = found_src else {
-                    return Err(
-                        [
-                            "the usage check needs the standard library source, without which reference counts are wrong",
-                            "supply it with `rustup component add rust-src`, by setting RUST_SRC_PATH, or with --rust-src <dir>",
-                            "on nix: nix-build '<nixpkgs>' -A rustPlatform.rustLibSrc --no-out-link",
-                        ].join("\n  "),
-                    );
-                };
-                let mut cargo_config = CargoConfig::default();
-                cargo_config.all_targets = true;
-                cargo_config.set_test = true;
-                cargo_config.sysroot = Some(RustLibSource::Discover);
-                let absolute = std::fs::canonicalize(&rust_src).unwrap_or(rust_src);
-                cargo_config.sysroot_src = Some(AbsPathBuf::assert_utf8(absolute));
-                let load_config = LoadCargoConfig {
-                    load_out_dirs_from_check: true,
-                    with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-                    prefill_caches: false,
-                    num_worker_threads: 1,
-                    proc_macro_processes: 1,
-                };
-                let (db, vfs, proc_macro) =
-                    load_workspace_at(
-                        cargo_root,
-                        &cargo_config,
-                        &load_config,
-                        &|_| { },
-                    ).map_err(|e| format!("failed to load the cargo workspace at {}: {}", cargo_root.display(), e))?;
-                let derives_expand = proc_macro.is_some();
-                if !derives_expand {
-                    eprintln!(
-                        "note: no proc-macro server available, so derive-generated uses are invisible; skipping fields"
-                    );
-                }
-                let found = ra_ap_hir::attach_db(&db, || {
-                    let db = &db;
-                    let vfs = &vfs;
-                    let mut problems = vec![];
-                    let sema = Semantics::new(db);
-                    let mut locals: Vec<Definition> = vec![];
-                    let counts = {
-                        let mut counts = HashMap::new();
-                        for (file_id, path) in vfs.iter() {
-                            let Some(path) = path.as_path() else {
-                                continue;
-                            };
-                            if !path.as_str().ends_with(".rs") {
-                                continue;
-                            }
-                            if !sema.file_to_module_defs(file_id).any(|m| m.krate(db).origin(db).is_local()) {
-                                continue;
-                            }
-                            let source = sema.parse(sema.attach_first_edition(file_id));
-                            usage::tally(&sema, source.syntax(), 0, &mut counts, &mut locals);
-                        }
-                        counts
-                    };
-                    let repo_root = root.as_path();
-                    let binary_crates: Vec<Crate> =
-                        Crate::all(db).into_iter().filter(|k| k.origin(db).is_local()).filter(|k| {
-                            return k.root_module(db).declarations(db).into_iter().any(|d| {
-                                let ModuleDef::Function(f) = d else {
-                                    return false;
-                                };
-                                return f.name(db).as_str() == "main";
-                            });
-                        }).collect();
-                    let mut defs: Vec<Definition> = locals;
-                    for krate in Crate::all(db) {
-                        if !krate.origin(db).is_local() {
-                            continue;
-                        }
-                        for module in krate.modules(db) {
-                            for decl in module.declarations(db) {
-                                match decl {
-                                    ModuleDef::Module(_) => continue,
-                                    ModuleDef::Adt(adt) => {
-                                        defs.push(Definition::Adt(adt));
-                                        if let ra_ap_hir::Adt::Struct(s) = adt {
-                                            let derived =
-                                                usage::locate(&sema, vfs, repo_root, Definition::Adt(adt))
-                                                    .map(
-                                                        |(_, text)| text
-                                                            .lines()
-                                                            .any(|l| l.trim_start().starts_with("#[derive")),
-                                                    )
-                                                    .unwrap_or(true);
-                                            if !derived {
-                                                for field in s.fields(db) {
-                                                    defs.push(Definition::Field(field));
-                                                }
-                                            }
-                                        }
-                                    },
-                                    other => defs.push(Definition::from(other)),
-                                }
-                            }
-                            for imp in module.impl_defs(db) {
-                                if imp.trait_(db).is_some() {
-                                    continue;
-                                }
-                                for item in imp.items(db) {
-                                    defs.push(Definition::from(item));
-                                }
-                            }
-                        }
-                    }
-                    for def in defs {
-                        let Some(name) = def.name(db) else {
-                            continue;
-                        };
-                        let name = name.as_str().to_string();
-                        if name == "main" {
-                            continue;
-                        }
-                        if name.chars().all(|c| c.is_ascii_digit()) {
-                            continue;
-                        }
-                        if matches!(def, Definition::Local(_)) && name.starts_with('_') {
-                            continue;
-                        }
-                        if let Definition::Function(f) = def {
-                            if f.attrs(db).is_test() {
-                                continue;
-                            }
-                        }
-                        let ignore_pub =
-                            def.module(db).map(|m| binary_crates.contains(&m.krate(db))).unwrap_or(false);
-                        if !ignore_pub {
-                            let vis = match def {
-                                Definition::Field(f) => Some(f.visibility(db)),
-                                Definition::Function(f) => Some(f.visibility(db)),
-                                Definition::Adt(a) => Some(a.visibility(db)),
-                                Definition::Const(c) => Some(c.visibility(db)),
-                                Definition::Static(s) => Some(s.visibility(db)),
-                                Definition::TypeAlias(t) => Some(t.visibility(db)),
-                                Definition::Trait(t) => Some(t.visibility(db)),
-                                _ => None,
-                            };
-                            let visible = matches!(vis, Some(Visibility::Public));
-                            if visible {
-                                continue;
-                            }
-                        }
-                        let Some((where_, item_text)) = usage::locate(&sema, &vfs, repo_root, def) else {
-                            continue;
-                        };
-                        let mut is_test = false;
-                        for line in item_text.lines() {
-                            let line = line.trim();
-                            if !line.starts_with("#[") {
-                                if !line.is_empty() && !line.starts_with("//") {
-                                    break;
-                                }
-                                continue;
-                            }
-                            if line.ends_with("test]") || line.contains("(test)") || line.ends_with("bench]") {
-                                is_test = true;
-                                break;
-                            }
-                        }
-                        if is_test {
-                            continue;
-                        }
-                        if item_text.lines().any(|l| l.trim_start().starts_with("#[proc_macro")) {
-                            continue;
-                        }
-                        if let Definition::Function(_) = def {
-                            if !item_text.contains(&format!("fn {}", name)) {
-                                continue;
-                            }
-                        }
-                        let count = counts.get(&def).copied().unwrap_or(0);
-                        let message = match count {
-                            0 => format!("{} `{}` is never used", usage::describe(db, def), name),
-                            1 => {
-                                match def {
-                                    Definition::Function(_) | Definition::Const(_) | Definition::Static(_) => { },
-                                    _ => continue,
-                                }
-                                format!(
-                                    "{} `{}` is used exactly once; consider inlining it",
-                                    usage::describe(db, def),
-                                    name
-                                )
-                            },
-                            _ => continue,
-                        };
-                        problems.push(Problem {
-                            check: "usage",
-                            path: where_.path,
-                            line: where_.line,
-                            message: message,
-                        });
-                    }
-                    return problems;
+            for comment in group {
+                problems.push(Problem {
+                    check: "comments".to_string(),
+                    path: comment.path,
+                    line: comment.line,
+                    message: format!(
+                        "this {} appears verbatim elsewhere; say it once or not at all: {}",
+                        kind,
+                        shown
+                    ),
                 });
-                problems.extend(found);
             }
         }
-        problems.sort_by(|a, b| (a.path.as_str(), a.line, a.check).cmp(&(b.path.as_str(), b.line, b.check)));
+        for problem in &mut problems {
+            problem.path =
+                Path::new(&problem.path)
+                    .strip_prefix(&root)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| problem.path.clone());
+        }
+        problems.sort();
+        problems.dedup();
         for problem in &problems {
-            if problem.path.is_empty() {
-                println!("[{}] {}", problem.check, problem.message);
-            } else {
-                println!("{}:{}: [{}] {}", problem.path, problem.line, problem.check, problem.message);
-            }
+            println!("{}:{}: [{}] {}", problem.path, problem.line, problem.check, problem.message);
         }
         if problems.is_empty() {
             return Ok(0);
@@ -657,7 +327,7 @@ fn main() {
     })() {
         Ok(code) => exit(code),
         Err(e) => {
-            eprintln!("schemask-lint: {}", e);
+            eprintln!("rust-ai-lint: {}", e);
             exit(2);
         },
     }
