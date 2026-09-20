@@ -50,7 +50,7 @@ use {
 };
 
 const USAGE: &str =
-    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, and restores the\ncomments of every tracked file to what they were at <rev> (default HEAD).\nWhen git is committing (GIT_INDEX_FILE is set) it reads and fixes what is\nstaged, otherwise it reads and fixes the working tree. Every check is run;\nnone of them can be turned off.";
+    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, restores the\ncomments of every tracked rust file to what they were at <rev> (default\nHEAD), and puts every tracked markdown file back the way it was at <rev>.\nWhen git is committing (GIT_INDEX_FILE is set) it reads and fixes what is\nstaged, otherwise it reads and fixes the working tree. Every check is run;\nnone of them can be turned off.";
 
 fn cargo() -> PathBuf {
     return std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
@@ -121,6 +121,49 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     return Ok(String::from_utf8_lossy(&out.stdout).to_string());
 }
 
+fn apply(
+    repo: &Path,
+    path: &str,
+    mode: &str,
+    at: &Path,
+    source: &str,
+    rendered: &str,
+    committing: bool,
+) -> Result<(), String> {
+    if rendered == source {
+        return Ok(());
+    }
+    if !committing {
+        std::fs::write(at, rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
+        return Ok(());
+    }
+    let mut child =
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to run git hash-object: {}", e))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "git hash-object took no stdin".to_string())?
+        .write_all(rendered.as_bytes())
+        .map_err(|e| format!("failed to hand {} to git hash-object: {}", path, e))?;
+    let out = child.wait_with_output().map_err(|e| format!("failed to run git hash-object: {}", e))?;
+    if !out.status.success() {
+        return Err("git hash-object failed".to_string());
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    git(repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
+    if std::fs::read_to_string(at).is_ok_and(|text| text == source) {
+        std::fs::write(at, rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
+    }
+    return Ok(());
+}
+
 fn main() {
     let wrapping = std::env::var_os(OUT_DIR_ENV).is_some() && std::env::args_os().count() > 1;
     if wrapping {
@@ -162,18 +205,18 @@ fn main() {
         let mut was: BTreeMap<String, String> = BTreeMap::new();
         if known {
             for path in git(&repo, &["ls-tree", "-r", "--name-only", "-z", &against])?.split('\0') {
-                if !path.ends_with(".rs") {
+                if !path.ends_with(".rs") && !path.ends_with(".md") {
                     continue;
                 }
                 was.insert(path.to_string(), git(&repo, &["show", &format!("{}:{}", against, path)])?);
             }
         }
-        let mut unstaged = vec![];
         for entry in git(&repo, &["ls-files", "--stage", "-z"])?.split('\0') {
             let Some((meta, path)) = entry.split_once('\t') else {
                 continue;
             };
-            if !path.ends_with(".rs") {
+            let markdown = path.ends_with(".md");
+            if !path.ends_with(".rs") && !markdown {
                 continue;
             }
             let Some(mode) = meta.split_whitespace().next() else {
@@ -187,6 +230,13 @@ fn main() {
                     Err(_) => continue,
                 },
             };
+            if markdown {
+                let Some(older) = was.get(path) else {
+                    continue;
+                };
+                apply(&repo, path, mode, &at, &source, older, committing)?;
+                continue;
+            }
             let config = (|| {
                 let mut dir = at.parent();
                 while let Some(here) = dir {
@@ -211,7 +261,6 @@ fn main() {
                         (Some(&source[..end]), &source[end..])
                     },
                 };
-                let offset = shebang.map(|_| 1).unwrap_or(0);
                 let (mut whitespaces, tokens) =
                     extract_whitespaces(
                         config.keep_max_blank_lines,
@@ -263,24 +312,12 @@ fn main() {
                         );
                     for (index, comment) in spot.comments.iter().enumerate() {
                         let Some(from) = matched[index] else {
-                            println!(
-                                "{}:{}: [comments] removed a comment that was not there before: {}",
-                                path,
-                                spot.lines[index] + offset,
-                                comments::shown(comment)
-                            );
                             remove.push((into, index));
                             continue;
                         };
                         if comments::collapse(&older[from].lines) == comments::collapse(&comment.lines) {
                             continue;
                         }
-                        println!(
-                            "{}:{}: [comments] put back a comment that had been reworded: {}",
-                            path,
-                            spot.lines[index] + offset,
-                            comments::shown(comment)
-                        );
                         restore.push((into, index, older[from].clone()));
                     }
                 }
@@ -333,47 +370,7 @@ fn main() {
                     continue;
                 },
             };
-            if rendered == source {
-                continue;
-            }
-            if !committing {
-                std::fs::write(&at, &rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
-                continue;
-            }
-            let mut child =
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&repo)
-                    .args(["hash-object", "-w", "--stdin"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("failed to run git hash-object: {}", e))?;
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| "git hash-object took no stdin".to_string())?
-                .write_all(rendered.as_bytes())
-                .map_err(|e| format!("failed to hand {} to git hash-object: {}", path, e))?;
-            let out = child.wait_with_output().map_err(|e| format!("failed to run git hash-object: {}", e))?;
-            if !out.status.success() {
-                return Err("git hash-object failed".to_string());
-            }
-            let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            git(&repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
-            match std::fs::read_to_string(&at) {
-                Ok(text) if text == source => {
-                    std::fs::write(&at, &rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
-                },
-                Ok(_) => unstaged.push(path.to_string()),
-                Err(_) => { },
-            }
-        }
-        for path in &unstaged {
-            println!(
-                "{}:1: [comments] fixed in the commit only; the copy on disk has unstaged edits and was left alone",
-                path
-            );
+            apply(&repo, path, mode, &at, &source, &rendered, committing)?;
         }
         let mut manifests = vec![];
         find_manifests(&root, &mut manifests);

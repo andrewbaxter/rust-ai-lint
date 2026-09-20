@@ -18,26 +18,15 @@ pub struct Spot {
     pub at: Vec<At>,
     pub code: String,
     pub comments: Vec<Comment>,
-    pub lines: Vec<usize>,
 }
 
 pub fn collapse(text: &str) -> String {
     return text.split_whitespace().collect::<Vec<_>>().join(" ");
 }
 
-pub fn shown(comment: &Comment) -> String {
-    const LIMIT: usize = 60;
-    let collapsed = collapse(&comment.lines);
-    if collapsed.chars().count() <= LIMIT {
-        return collapsed;
-    }
-    return format!("{}...", collapsed.chars().take(LIMIT).collect::<String>());
-}
-
 pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str) -> Vec<Spot> {
     let lines = text.lines().collect::<Vec<_>>();
     let mut out = vec![];
-    let mut after = 0usize;
     let ordered =
         whitespaces
             .iter()
@@ -65,20 +54,6 @@ pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str)
         if comments.is_empty() {
             continue;
         }
-        let limit = match key.0.line {
-            0 => lines.len(),
-            line => line - 1,
-        };
-        let mut found = vec![];
-        for comment in &comments {
-            let first = comment.lines.lines().next().unwrap_or_default().trim();
-            let at =
-                (after .. limit)
-                    .find(|i| return !first.is_empty() && lines[*i].trim_end().ends_with(first))
-                    .unwrap_or(after.min(limit));
-            found.push(at + 1);
-            after = at + comment.lines.lines().count().max(1);
-        }
         let code = match key.0.line {
             0 => "\u{0}end of file".to_string(),
             line => {
@@ -97,7 +72,6 @@ pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str)
             at: at,
             code: code,
             comments: comments,
-            lines: found,
         });
     }
     return out;
