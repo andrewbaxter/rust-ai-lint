@@ -64,13 +64,14 @@ pub struct Walk<'a, 'tcx> {
 
 impl<'a, 'tcx> Walk<'a, 'tcx> {
     fn record(&mut self, key: String, span: Span) {
-        let Some((path, line, col)) = place(self.tcx, span) else {
-            return;
+        let site = match place(self.tcx, span) {
+            Some((path, line, col)) => format!("{}:{}:{}", path, line, col),
+            None => format!("{:?}", span),
         };
         let generated = self.generated || span.from_expansion();
         self.report.uses.push(Use {
             key: key,
-            site: format!("{}:{}:{}", path, line, col),
+            site: site,
             generated: generated,
         });
     }
@@ -144,6 +145,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
             return Some(self.tcx.typeck(root));
         })();
         let Some(typeck) = typeck else {
+            self.untyped(expr.span, "an expression");
             rustc_hir::intravisit::walk_expr(self, expr);
             return;
         };
@@ -217,10 +219,16 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
     }
 
     fn visit_pat(&mut self, pat: &'tcx rustc_hir::Pat<'tcx>) {
-        if matches!(pat.kind, rustc_hir::PatKind::Or(..)) {
-            self.in_or_pattern += 1;
-            rustc_hir::intravisit::walk_pat(self, pat);
-            self.in_or_pattern -= 1;
+        if let rustc_hir::PatKind::Or(alternatives) = pat.kind {
+            for (index, alternative) in alternatives.iter().enumerate() {
+                if index > 0 {
+                    self.in_or_pattern += 1;
+                }
+                self.visit_pat(alternative);
+                if index > 0 {
+                    self.in_or_pattern -= 1;
+                }
+            }
             return;
         }
         if let rustc_hir::PatKind::Binding(_, _, ident, _) = pat.kind {

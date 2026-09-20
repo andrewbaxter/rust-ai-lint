@@ -75,6 +75,10 @@ impl rustc_driver::Callbacks for Callbacks {
                     DefKind::Static { .. } => {
                         checker.name(span, &name, "static", "SCREAMING_SNAKE_CASE", is_screaming(&name))
                     },
+                    DefKind::AssocTy => {
+                        checker.name(span, &name, "associated type", "UpperCamelCase", is_upper_camel(&name))
+                    },
+                    DefKind::Macro(..) => checker.name(span, &name, "macro", "snake_case", is_snake(&name)),
                     _ => { },
                 }
             }
@@ -123,16 +127,44 @@ impl rustc_driver::Callbacks for Callbacks {
         }
         for owner in tcx.hir_body_owners() {
             let kind = tcx.def_kind(owner);
-            if !matches!(kind, DefKind::Fn | DefKind::AssocFn) {
+            if !matches!(kind, DefKind::Fn | DefKind::AssocFn | DefKind::Closure) {
                 continue;
             }
-            if tcx.fn_sig(owner).skip_binder().skip_binder().output().is_unit() {
+            let coroutine = tcx.coroutine_kind(owner);
+            let async_block =
+                matches!(coroutine, Some(rustc_hir::CoroutineKind::Desugared(_, rustc_hir::CoroutineSource::Block)));
+            if kind == DefKind::Closure && coroutine.is_some() && !async_block {
                 continue;
             }
             if tcx.def_span(owner).from_expansion() {
                 continue;
             }
-            let rustc_hir::ExprKind::Block(block, _) = tcx.hir_body_owned_by(owner).value.kind else {
+            let value = tcx.hir_body_owned_by(owner).value;
+            let value = match value.kind {
+                rustc_hir::ExprKind::Closure(closure) if
+                    matches!(
+                        closure.kind,
+                        rustc_hir::ClosureKind::Coroutine(
+                            rustc_hir::CoroutineKind::Desugared(
+                                _,
+                                rustc_hir::CoroutineSource::Fn | rustc_hir::CoroutineSource::Closure,
+                            ),
+                        )
+                    ) => {
+                    let rustc_hir::ExprKind::Block(wrapper, _) = tcx.hir_body(closure.body).value.kind else {
+                        continue;
+                    };
+                    let Some(wrapped) = wrapper.expr else {
+                        continue;
+                    };
+                    match wrapped.kind {
+                        rustc_hir::ExprKind::DropTemps(inner) => inner,
+                        _ => wrapped,
+                    }
+                },
+                _ => value,
+            };
+            let rustc_hir::ExprKind::Block(block, _) = value.kind else {
                 continue;
             };
             let Some(tail) = block.expr else {
@@ -141,24 +173,35 @@ impl rustc_driver::Callbacks for Callbacks {
             if tail.span.from_expansion() {
                 continue;
             }
-            if diverges(tcx.typeck(owner), tail) {
+            if tail.span == block.span || !block.span.contains(tail.span) {
+                continue;
+            }
+            let Some(root) = tcx.typeck_root_def_id(owner.to_def_id()).as_local() else {
+                continue;
+            };
+            let typeck = tcx.typeck(root);
+            if typeck.expr_ty(tail).is_unit() {
+                continue;
+            }
+            if diverges(typeck, tail) {
                 continue;
             }
             let Some((path, line, _)) =
                 place(tcx, tcx.def_ident_span(owner).unwrap_or(tcx.def_span(owner))) else {
                     continue;
                 };
-            let what = if kind == DefKind::Fn {
-                "function"
-            } else {
-                "method"
-            };
             let name = tcx.opt_item_name(owner.to_def_id()).map(|n| n.to_string()).unwrap_or_default();
+            let described = match kind {
+                DefKind::Fn => format!("function `{}`", name),
+                DefKind::AssocFn => format!("method `{}`", name),
+                _ if async_block => "this async block".to_string(),
+                _ => "this closure".to_string(),
+            };
             report.problems.push(Problem {
                 check: "returns".to_string(),
                 path: path,
                 line: line,
-                message: format!("{} `{}` hands back a value as a tail expression; write `return`", what, name),
+                message: format!("{} hands back a value as a tail expression; write `return`", described),
             });
         }
         if !tcx.sess.opts.test {

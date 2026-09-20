@@ -50,7 +50,7 @@ use {
 };
 
 const USAGE: &str =
-    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, and restores the\ncomments of everything staged for commit to what they were at <rev>\n(default HEAD). Every check is run; none of them can be turned off.";
+    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, and restores the\ncomments of every tracked file to what they were at <rev> (default HEAD).\nWhen git is committing (GIT_INDEX_FILE is set) it reads and fixes what is\nstaged, otherwise it reads and fixes the working tree. Every check is run;\nnone of them can be turned off.";
 
 fn cargo() -> PathBuf {
     return std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
@@ -158,6 +158,7 @@ fn main() {
         if !known && against != "HEAD" {
             return Err(format!("no commit named `{}`", against));
         }
+        let committing = std::env::var_os("GIT_INDEX_FILE").is_some();
         let mut was: BTreeMap<String, String> = BTreeMap::new();
         if known {
             for path in git(&repo, &["ls-tree", "-r", "--name-only", "-z", &against])?.split('\0') {
@@ -178,8 +179,14 @@ fn main() {
             let Some(mode) = meta.split_whitespace().next() else {
                 continue;
             };
-            let staged = git(&repo, &["show", &format!(":{}", path)])?;
             let at = repo.join(path);
+            let source = match committing {
+                true => git(&repo, &["show", &format!(":{}", path)])?,
+                false => match std::fs::read_to_string(&at) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                },
+            };
             let config = (|| {
                 let mut dir = at.parent();
                 while let Some(here) = dir {
@@ -197,11 +204,11 @@ fn main() {
                 return FormatConfig::default();
             })();
             let fixed = (|| -> Result<Option<String>, String> {
-                let (shebang, body) = match staged.starts_with("#!/") {
-                    false => (None, staged.as_str()),
+                let (shebang, body) = match source.starts_with("#!/") {
+                    false => (None, source.as_str()),
                     true => {
-                        let end = staged.find('\n').map(|o| o + 1).unwrap_or(staged.len());
-                        (Some(&staged[..end]), &staged[end..])
+                        let end = source.find('\n').map(|o| o + 1).unwrap_or(source.len());
+                        (Some(&source[..end]), &source[end..])
                     },
                 };
                 let offset = shebang.map(|_| 1).unwrap_or(0);
@@ -277,15 +284,15 @@ fn main() {
                         restore.push((into, index, older[from].clone()));
                     }
                 }
-                for (into, index, source) in restore {
+                for (into, index, older) in restore {
                     let spot = &spots[into].at[index];
                     let group =
                         whitespaces.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
                     let WhitespaceMode::Comment(comment) = &mut group[spot.index].mode else {
                         return Err("a comment left its anchor".to_string());
                     };
-                    comment.lines = source.lines;
-                    comment.mode = source.mode;
+                    comment.lines = older.lines;
+                    comment.mode = older.mode;
                 }
                 remove.sort_by_key(|(into, index)| {
                     let spot = &spots[*into].at[*index];
@@ -326,7 +333,11 @@ fn main() {
                     continue;
                 },
             };
-            if rendered == staged {
+            if rendered == source {
+                continue;
+            }
+            if !committing {
+                std::fs::write(&at, &rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
                 continue;
             }
             let mut child =
@@ -351,7 +362,7 @@ fn main() {
             let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
             git(&repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
             match std::fs::read_to_string(&at) {
-                Ok(text) if text == staged => {
+                Ok(text) if text == source => {
                     std::fs::write(&at, &rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
                 },
                 Ok(_) => unstaged.push(path.to_string()),
