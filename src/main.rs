@@ -125,10 +125,10 @@ fn main() {
         return;
     }
     if std::env::args_os().count() > 1 {
-        eprintln!(
+        println!(
             "rust-ai-lint takes no arguments: it checks every cargo project under the current directory, and every check it knows."
         );
-        exit(2);
+        exit(1);
     }
 
     // Checks every cargo project under the current directory, then reports what it
@@ -327,8 +327,8 @@ fn main() {
     })() {
         Ok(code) => exit(code),
         Err(e) => {
-            eprintln!("rust-ai-lint: {}", e);
-            exit(2);
+            println!("rust-ai-lint: {}", e);
+            exit(1);
         },
     }
 }

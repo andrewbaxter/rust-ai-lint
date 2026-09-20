@@ -393,8 +393,8 @@ impl rustc_driver::Callbacks for Callbacks {
                 return std::fs::write(&at, text).map_err(|e| e.to_string());
             });
             if let Err(e) = written {
-                eprintln!("rust-ai-lint: cannot write findings to {}: {}", at.display(), e);
-                exit(2);
+                println!("rust-ai-lint: cannot write findings to {}: {}", at.display(), e);
+                exit(1);
             }
         }
         return rustc_driver::Compilation::Continue;
