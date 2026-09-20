@@ -75,13 +75,6 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
     }
 }
 
-/// True when control never runs off the end of this expression.
-///
-/// The compiler answers most of this for us: anything that doesn't come back has
-/// type `!`, which covers `panic!`, `std::process::exit`, and a loop with no
-/// break. It doesn't cover a branch that returns, because a `return` in a branch
-/// is coerced to whatever the other branches produce, so the shape of the branches
-/// is read directly.
 pub fn diverges<'tcx>(typeck: &rustc_middle::ty::TypeckResults<'tcx>, expr: &rustc_hir::Expr<'tcx>) -> bool {
     if typeck.expr_ty(expr).is_never() {
         return true;

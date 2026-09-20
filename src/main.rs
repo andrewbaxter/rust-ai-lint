@@ -1,6 +1,7 @@
 #![feature(rustc_private)]
 
 mod collect;
+mod comments;
 mod driver;
 mod style;
 mod wire;
@@ -15,12 +16,18 @@ extern crate rustc_span;
 
 use {
     crate::wire::{
-        Comment,
         Def,
         OUT_DIR_ENV,
         Problem,
         Report,
         Use,
+    },
+    genemichaels_lib::{
+        CommentMode,
+        FormatConfig,
+        WhitespaceMode,
+        extract_whitespaces,
+        format_ast,
     },
     std::{
         collections::{
@@ -29,28 +36,26 @@ use {
             HashMap,
         },
         ffi::OsStr,
+        io::Write,
         path::{
             Path,
             PathBuf,
         },
         process::{
             Command,
+            Stdio,
             exit,
         },
     },
 };
 
+const USAGE: &str =
+    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, and restores the\ncomments of everything staged for commit to what they were at <rev>\n(default HEAD). Every check is run; none of them can be turned off.";
+
 fn cargo() -> PathBuf {
     return std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
 }
 
-/// Cargo skips crates whose sources haven't changed, and a skipped crate reports
-/// nothing at all - which would read as "this crate has no code in it". Throwing
-/// away what cargo built for the workspace's own crates makes every run see the
-/// whole workspace; dependencies keep their cache, which is most of the time.
-///
-/// Cargo has moved this directory around between releases, so rather than knowing
-/// the layout, look for anything named after a member crate.
 fn clear_members(dir: &Path, members: &BTreeSet<String>, depth: usize) {
     if depth > 4 {
         return;
@@ -80,7 +85,6 @@ fn clear_members(dir: &Path, members: &BTreeSet<String>, depth: usize) {
     }
 }
 
-/// Every directory holding a manifest, skipping build output and anything hidden.
 fn find_manifests(dir: &Path, found: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -103,16 +107,24 @@ fn find_manifests(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Two roles share one binary. Cargo runs it as a compiler wrapper, with the real
-/// rustc as the first argument and our output directory in the environment;
-/// anything else is a person running the checker.
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out =
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to run git {:?}: {}", args, e))?;
+    if !out.status.success() {
+        return Err(format!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+}
+
 fn main() {
     let wrapping = std::env::var_os(OUT_DIR_ENV).is_some() && std::env::args_os().count() > 1;
     if wrapping {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
-
-        // The checker doesn't live in the toolchain, so rustc can't work out where the
-        // standard library is from our own path; the real compiler cargo handed us knows.
         if !args.iter().any(|a| a == "--sysroot" || a.starts_with("--sysroot=")) {
             let found =
                 Command::new(&args[0]).args(["--print", "sysroot"]).output().ok().filter(|o| o.status.success());
@@ -124,26 +136,239 @@ fn main() {
         rustc_driver::run_compiler(&args, &mut driver::Callbacks);
         return;
     }
-    if std::env::args_os().count() > 1 {
-        println!(
-            "rust-ai-lint takes no arguments: it checks every cargo project under the current directory, and every check it knows."
-        );
-        exit(1);
-    }
-
-    // Checks every cargo project under the current directory, then reports what it
-    // found. Nothing here is optional and nothing is advisory: a non-empty report
-    // means the tree is not acceptable.
     match (|| -> Result<i32, String> {
+        let mut against = "HEAD".to_string();
+        let mut argv = std::env::args().skip(1);
+        while let Some(arg) = argv.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    println!("{}", USAGE);
+                    exit(0);
+                },
+                "--against" => {
+                    against = argv.next().ok_or_else(|| format!("--against needs a revision\n\n{}", USAGE))?;
+                },
+                other => return Err(format!("unrecognized argument `{}`\n\n{}", other, USAGE)),
+            }
+        }
         let root = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {}", e))?;
+        let mut problems: Vec<Problem> = vec![];
+        let repo = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"])?.trim());
+        let known = git(&repo, &["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", against)]).is_ok();
+        if !known && against != "HEAD" {
+            return Err(format!("no commit named `{}`", against));
+        }
+        let mut was: BTreeMap<String, String> = BTreeMap::new();
+        if known {
+            for path in git(&repo, &["ls-tree", "-r", "--name-only", "-z", &against])?.split('\0') {
+                if !path.ends_with(".rs") {
+                    continue;
+                }
+                was.insert(path.to_string(), git(&repo, &["show", &format!("{}:{}", against, path)])?);
+            }
+        }
+        let mut unstaged = vec![];
+        for entry in git(&repo, &["ls-files", "--stage", "-z"])?.split('\0') {
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            if !path.ends_with(".rs") {
+                continue;
+            }
+            let Some(mode) = meta.split_whitespace().next() else {
+                continue;
+            };
+            let staged = git(&repo, &["show", &format!(":{}", path)])?;
+            let at = repo.join(path);
+            let config = (|| {
+                let mut dir = at.parent();
+                while let Some(here) = dir {
+                    for name in [".genemichaels.json", "genemichaels.json"] {
+                        let Ok(found) = std::fs::read_to_string(here.join(name)) else {
+                            continue;
+                        };
+                        let Ok(parsed) = serde_json::from_str(&found) else {
+                            continue;
+                        };
+                        return parsed;
+                    }
+                    dir = here.parent();
+                }
+                return FormatConfig::default();
+            })();
+            let fixed = (|| -> Result<Option<String>, String> {
+                let (shebang, body) = match staged.starts_with("#!/") {
+                    false => (None, staged.as_str()),
+                    true => {
+                        let end = staged.find('\n').map(|o| o + 1).unwrap_or(staged.len());
+                        (Some(&staged[..end]), &staged[end..])
+                    },
+                };
+                let offset = shebang.map(|_| 1).unwrap_or(0);
+                let (mut whitespaces, tokens) =
+                    extract_whitespaces(
+                        config.keep_max_blank_lines,
+                        body,
+                    ).map_err(|e| format!("cannot be read: {}", e))?;
+                for group in whitespaces.values() {
+                    for whitespace in group {
+                        let WhitespaceMode::Comment(comment) = &whitespace.mode else {
+                            continue;
+                        };
+                        if comment.mode == CommentMode::Directive &&
+                            comment.lines.lines().any(|line| line.trim() == "genemichaels-file-skip") {
+                            return Ok(None);
+                        }
+                    }
+                }
+                let spots = comments::walk(&whitespaces, body);
+                let before = match was.get(path) {
+                    None => vec![],
+                    Some(old) => {
+                        let (whitespaces, _) =
+                            extract_whitespaces(
+                                config.keep_max_blank_lines,
+                                old,
+                            ).map_err(|e| format!("cannot be read: {}", e))?;
+                        comments::walk(&whitespaces, old)
+                    },
+                };
+                let anchored = comments::pairs(&before, &spots, |old, new| return old.code == new.code, |old, new| {
+                    let left = old.code.split_whitespace().collect::<BTreeSet<_>>();
+                    let right = new.code.split_whitespace().collect::<BTreeSet<_>>();
+                    let most = left.len().max(right.len());
+                    return most > 0 && left.intersection(&right).count() * 2 >= most;
+                });
+                let mut restore = vec![];
+                let mut remove = vec![];
+                for (into, spot) in spots.iter().enumerate() {
+                    let older: &[genemichaels_lib::Comment] = match anchored[into] {
+                        Some(from) => &before[from].comments,
+                        None => &[],
+                    };
+                    let matched =
+                        comments::pairs(
+                            older,
+                            &spot.comments,
+                            |old, new| return old.mode == new.mode &&
+                                comments::collapse(&old.lines) == comments::collapse(&new.lines),
+                            |old, new| return old.mode == new.mode,
+                        );
+                    for (index, comment) in spot.comments.iter().enumerate() {
+                        let Some(from) = matched[index] else {
+                            println!(
+                                "{}:{}: [comments] removed a comment that was not there before: {}",
+                                path,
+                                spot.lines[index] + offset,
+                                comments::shown(comment)
+                            );
+                            remove.push((into, index));
+                            continue;
+                        };
+                        if comments::collapse(&older[from].lines) == comments::collapse(&comment.lines) {
+                            continue;
+                        }
+                        println!(
+                            "{}:{}: [comments] put back a comment that had been reworded: {}",
+                            path,
+                            spot.lines[index] + offset,
+                            comments::shown(comment)
+                        );
+                        restore.push((into, index, older[from].clone()));
+                    }
+                }
+                for (into, index, source) in restore {
+                    let spot = &spots[into].at[index];
+                    let group =
+                        whitespaces.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
+                    let WhitespaceMode::Comment(comment) = &mut group[spot.index].mode else {
+                        return Err("a comment left its anchor".to_string());
+                    };
+                    comment.lines = source.lines;
+                    comment.mode = source.mode;
+                }
+                remove.sort_by_key(|(into, index)| {
+                    let spot = &spots[*into].at[*index];
+                    return std::cmp::Reverse((spot.key, spot.index));
+                });
+                for (into, index) in remove {
+                    let spot = &spots[into].at[index];
+                    let group =
+                        whitespaces.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
+                    group.remove(spot.index);
+                }
+                let parsed = syn::parse2::<syn::File>(tokens).map_err(|e| format!("cannot be parsed: {}", e))?;
+                let done =
+                    format_ast(parsed, &config, whitespaces).map_err(|e| format!("cannot be formatted: {}", e))?;
+                if !done.lost_comments.is_empty() {
+                    return Err(
+                        format!(
+                            "formatting would drop {} comment(s); move them somewhere the formatter can keep",
+                            done.lost_comments.len()
+                        ),
+                    );
+                }
+                return Ok(Some(match shebang {
+                    Some(shebang) => format!("{}{}", shebang, done.rendered),
+                    None => done.rendered,
+                }));
+            })();
+            let rendered = match fixed {
+                Ok(None) => continue,
+                Ok(Some(rendered)) => rendered,
+                Err(e) => {
+                    problems.push(Problem {
+                        check: "comments".to_string(),
+                        path: path.to_string(),
+                        line: 1,
+                        message: e,
+                    });
+                    continue;
+                },
+            };
+            if rendered == staged {
+                continue;
+            }
+            let mut child =
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(["hash-object", "-w", "--stdin"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("failed to run git hash-object: {}", e))?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| "git hash-object took no stdin".to_string())?
+                .write_all(rendered.as_bytes())
+                .map_err(|e| format!("failed to hand {} to git hash-object: {}", path, e))?;
+            let out = child.wait_with_output().map_err(|e| format!("failed to run git hash-object: {}", e))?;
+            if !out.status.success() {
+                return Err("git hash-object failed".to_string());
+            }
+            let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            git(&repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
+            match std::fs::read_to_string(&at) {
+                Ok(text) if text == staged => {
+                    std::fs::write(&at, &rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
+                },
+                Ok(_) => unstaged.push(path.to_string()),
+                Err(_) => { },
+            }
+        }
+        for path in &unstaged {
+            println!(
+                "{}:1: [comments] fixed in the commit only; the copy on disk has unstaged edits and was left alone",
+                path
+            );
+        }
         let mut manifests = vec![];
         find_manifests(&root, &mut manifests);
         if manifests.is_empty() {
             return Err(format!("no cargo project found under {}", root.display()));
         }
-
-        // Ask cargo which workspace each manifest belongs to, so that a workspace with
-        // many member crates is checked once rather than once per member.
         let mut workspaces: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
         for manifest in manifests {
             let out =
@@ -179,8 +404,6 @@ fn main() {
             }
             workspaces.insert(PathBuf::from(workspace_root), members);
         }
-
-        // Each crate the compiler wrapper sees writes what it found here.
         let out_dir = root.join("target").join("rust-ai-lint-reports");
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).map_err(|e| format!("cannot create {}: {}", out_dir.display(), e))?;
@@ -206,10 +429,8 @@ fn main() {
                 );
             }
         }
-        let mut problems: Vec<Problem> = vec![];
         let mut defs: Vec<Def> = vec![];
         let mut uses: Vec<Use> = vec![];
-        let mut comments: Vec<Comment> = vec![];
         let entries = std::fs::read_dir(&out_dir).map_err(|e| format!("cannot read {}: {}", out_dir.display(), e))?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -223,7 +444,6 @@ fn main() {
             problems.extend(report.problems);
             defs.extend(report.defs);
             uses.extend(report.uses);
-            comments.extend(report.comments);
         }
         let _ = std::fs::remove_dir_all(&out_dir);
         if defs.is_empty() {
@@ -234,10 +454,6 @@ fn main() {
                 ),
             );
         }
-
-        // A def is dead if nothing names it, and asks to be dissolved if exactly one
-        // hand-written name refers to it. Names a macro produced keep a def alive but
-        // can't be rewritten, so they never ask for inlining.
         let mut sites: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
         for use_ in uses {
@@ -270,41 +486,6 @@ fn main() {
                 line: def.line,
                 message: message,
             });
-        }
-
-        // Prose is written once. The same sentence in two places is a sign it was
-        // generated rather than thought about, so every copy is reported.
-        let mut by_text: BTreeMap<(String, String), Vec<Comment>> = BTreeMap::new();
-        for comment in comments {
-            if comment.kind == "directive" {
-                continue;
-            }
-            by_text.entry((comment.kind.clone(), comment.text.clone())).or_default().push(comment);
-        }
-        for ((kind, text), mut group) in by_text {
-            group.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-            group.dedup_by(|a, b| a.path == b.path && a.line == b.line);
-            if group.len() < 2 {
-                continue;
-            }
-            const LIMIT: usize = 70;
-            let shown = if text.chars().count() <= LIMIT {
-                text.clone()
-            } else {
-                format!("{}...", text.chars().take(LIMIT).collect::<String>())
-            };
-            for comment in group {
-                problems.push(Problem {
-                    check: "comments".to_string(),
-                    path: comment.path,
-                    line: comment.line,
-                    message: format!(
-                        "this {} appears verbatim elsewhere; say it once or not at all: {}",
-                        kind,
-                        shown
-                    ),
-                });
-            }
         }
         for problem in &mut problems {
             problem.path =

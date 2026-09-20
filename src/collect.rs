@@ -17,7 +17,6 @@ use {
     rustc_span::Span,
     std::path::{
         Component,
-        Path,
         PathBuf,
     },
 };
@@ -32,21 +31,16 @@ pub fn def_key(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     return format!("def:{:x}:{:x}", hash.stable_crate_id().as_u64(), hash.local_hash().as_u64());
 }
 
-/// `a/b/../c` and `a/c` are the same file, and the compiler hands back whichever
-/// spelling the code used. Resolved by text so that this stays cheap: it is asked
-/// once per name in the crate.
-///
-/// Cargo runs the compiler from the workspace root and names files relative to it,
-/// so two workspaces both contain a `src/main.rs`. Everything is keyed and
-/// reported by path, so a relative name is anchored to the directory the compiler
-/// was started in.
-pub fn normalize(path: &Path) -> PathBuf {
+pub fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, usize, usize)> {
+    let span = span.source_callsite();
+    let map = tcx.sess.source_map();
+    let location = map.lookup_char_pos(span.lo());
+    let path = location.file.name.clone().into_local_path()?;
     let path = if path.is_absolute() {
-        path.to_path_buf()
+        path
     } else {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::new()).join(path)
     };
-    let path = path.as_path();
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -57,32 +51,12 @@ pub fn normalize(path: &Path) -> PathBuf {
             other => out.push(other),
         }
     }
-    return out;
-}
-
-/// Where something is written, in a form that is the same every time the same
-/// source is compiled - unlike byte offsets, which move when the set of loaded
-/// files changes.
-pub fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, usize, usize)> {
-    let span = span.source_callsite();
-    let map = tcx.sess.source_map();
-    let location = map.lookup_char_pos(span.lo());
-    let path = location.file.name.clone().into_local_path()?;
-    return Some((normalize(&path).display().to_string(), location.line, location.col.0 + 1));
+    return Some((out.display().to_string(), location.line, location.col.0 + 1));
 }
 
 pub struct Walk<'a, 'tcx> {
-    /// Set while walking something a macro wrote. A derive that calls a function names
-    /// it with the span of the attribute that asked for it, which is a real place in a
-    /// real file, so the span alone can't tell us who wrote the call.
     pub generated: bool,
-    /// Set while walking a constant used as part of a type, like the length in
-    /// `[f64; 4]`. Those are worked out by a separate query and are not in the type
-    /// tables of the body they appear in.
     pub in_const_arg: usize,
-    /// Set while walking the alternatives of an or-pattern. Each alternative binds its
-    /// own copy of the name but only one of them is what uses resolve to, so the
-    /// others would look untouched.
     pub in_or_pattern: usize,
     pub report: &'a mut Report,
     pub tcx: TyCtxt<'tcx>,
@@ -161,9 +135,6 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        // Expressions also turn up in places that are not part of any body - the length
-        // in `[f64; 4]`, for one - and asking to type check the thing that holds them is
-        // a question the compiler has no answer to.
         let owner = expr.hir_id.owner.def_id;
         let typeck = (|| {
             let root = self.tcx.typeck_root_def_id(owner.to_def_id()).as_local()?;

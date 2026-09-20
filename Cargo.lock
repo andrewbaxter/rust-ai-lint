@@ -399,6 +399,7 @@ dependencies = [
  "genemichaels-lib",
  "serde",
  "serde_json",
+ "syn 2.0.119",
 ]
 
 [[package]]

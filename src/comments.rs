@@ -1,0 +1,162 @@
+use {
+    genemichaels_lib::{
+        Comment,
+        CommentMode,
+        HashLineColumn,
+        Whitespace,
+        WhitespaceMode,
+    },
+    std::collections::BTreeMap,
+};
+
+pub struct At {
+    pub index: usize,
+    pub key: HashLineColumn,
+}
+
+pub struct Spot {
+    pub at: Vec<At>,
+    pub code: String,
+    pub comments: Vec<Comment>,
+    pub lines: Vec<usize>,
+}
+
+pub fn collapse(text: &str) -> String {
+    return text.split_whitespace().collect::<Vec<_>>().join(" ");
+}
+
+pub fn shown(comment: &Comment) -> String {
+    const LIMIT: usize = 60;
+    let collapsed = collapse(&comment.lines);
+    if collapsed.chars().count() <= LIMIT {
+        return collapsed;
+    }
+    return format!("{}...", collapsed.chars().take(LIMIT).collect::<String>());
+}
+
+pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str) -> Vec<Spot> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut out = vec![];
+    let mut after = 0usize;
+    let ordered =
+        whitespaces
+            .iter()
+            .filter(|(key, _)| key.0.line != 0)
+            .chain(whitespaces.iter().filter(|(key, _)| key.0.line == 0));
+    for (key, group) in ordered {
+        let mut at = vec![];
+        let mut comments = vec![];
+        for (index, whitespace) in group.iter().enumerate() {
+            let WhitespaceMode::Comment(comment) = &whitespace.mode else {
+                continue;
+            };
+            if comment.mode == CommentMode::Directive {
+                continue;
+            }
+            if collapse(&comment.lines).is_empty() {
+                continue;
+            }
+            at.push(At {
+                key: *key,
+                index: index,
+            });
+            comments.push(comment.clone());
+        }
+        if comments.is_empty() {
+            continue;
+        }
+        let limit = match key.0.line {
+            0 => lines.len(),
+            line => line - 1,
+        };
+        let mut found = vec![];
+        for comment in &comments {
+            let first = comment.lines.lines().next().unwrap_or_default().trim();
+            let at =
+                (after .. limit)
+                    .find(|i| return !first.is_empty() && lines[*i].trim_end().ends_with(first))
+                    .unwrap_or(after.min(limit));
+            found.push(at + 1);
+            after = at + comment.lines.lines().count().max(1);
+        }
+        let code = match key.0.line {
+            0 => "\u{0}end of file".to_string(),
+            line => {
+                let mut taken = vec![];
+                for at in line - 1 .. (line + 8).min(lines.len()) {
+                    let text = lines[at].trim();
+                    taken.push(text);
+                    if !text.starts_with('#') {
+                        break;
+                    }
+                }
+                collapse(&taken.join(" "))
+            },
+        };
+        out.push(Spot {
+            at: at,
+            code: code,
+            comments: comments,
+            lines: found,
+        });
+    }
+    return out;
+}
+
+pub fn pairs<
+    T,
+>(old: &[T], new: &[T], same: impl Fn(&T, &T) -> bool, swappable: impl Fn(&T, &T) -> bool) -> Vec<Option<usize>> {
+    let mut table = vec![
+        vec![
+            0u32;
+            new.len() + 1
+        ];
+        old.len() + 1
+    ];
+    for i in (0 .. old.len()).rev() {
+        for j in (0 .. new.len()).rev() {
+            table[i][j] = if same(&old[i], &new[j]) {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let mut common = vec![];
+    let mut i = 0;
+    let mut j = 0;
+    while i < old.len() && j < new.len() {
+        if same(&old[i], &new[j]) {
+            common.push((i, j));
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let mut out = (0 .. new.len()).map(|_| None).collect::<Vec<_>>();
+    let gap = |out: &mut Vec<Option<usize>>, old_run: std::ops::Range<usize>, new_run: std::ops::Range<usize>| {
+        let mut from = old_run.start;
+        for into in new_run {
+            while from < old_run.end && !swappable(&old[from], &new[into]) {
+                from += 1;
+            }
+            if from < old_run.end {
+                out[into] = Some(from);
+                from += 1;
+            }
+        }
+    };
+    let mut old_at = 0;
+    let mut new_at = 0;
+    for (i, j) in common {
+        gap(&mut out, old_at .. i, new_at .. j);
+        out[j] = Some(i);
+        old_at = i + 1;
+        new_at = j + 1;
+    }
+    gap(&mut out, old_at .. old.len(), new_at .. new.len());
+    return out;
+}
