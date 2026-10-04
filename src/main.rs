@@ -516,6 +516,19 @@ fn main() {
         }
         let mut defs: Vec<Def> = vec![];
         let mut uses: Vec<Use> = vec![];
+        let real_repo = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        let build_dirs: Vec<PathBuf> = workspaces.keys().map(|workspace_root| {
+            let target = workspace_root.join("target").join("rust-ai-lint");
+            return target.canonicalize().unwrap_or(target);
+        }).collect();
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        let mut ours = |path: &str| {
+            return *seen.entry(path.to_string()).or_insert_with(|| {
+                let at = Path::new(path);
+                let real = at.canonicalize().unwrap_or_else(|_| at.to_path_buf());
+                return real.starts_with(&real_repo) && !build_dirs.iter().any(|dir| real.starts_with(dir));
+            });
+        };
         let entries = std::fs::read_dir(&out_dir).map_err(|e| format!("cannot read {}: {}", out_dir.display(), e))?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -526,7 +539,7 @@ fn main() {
                 std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
             let report: Report =
                 serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {}", path.display(), e))?;
-            problems.extend(report.problems);
+            problems.extend(report.problems.into_iter().filter(|problem| return ours(&problem.path)));
             defs.extend(report.defs);
             uses.extend(report.uses);
         }
@@ -543,13 +556,14 @@ fn main() {
         let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
         for use_ in uses {
             sites.entry(use_.key.clone()).or_default().insert(use_.site.clone());
-            if !use_.generated {
+            let site_path = use_.site.rsplitn(3, ':').last().unwrap_or("");
+            if !use_.generated && ours(site_path) {
                 written.entry(use_.key).or_default().insert(use_.site);
             }
         }
         let mut judged = BTreeSet::new();
         for def in defs {
-            if def.exempt {
+            if def.exempt || !ours(&def.path) {
                 continue;
             }
             if !judged.insert(def.key.clone()) {
