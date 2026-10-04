@@ -13,6 +13,11 @@ use {
     rustc_middle::ty::{
         TyCtxt,
         TypeVisitableExt,
+        print::{
+            CrateNamePrefixGuard,
+            NoTrimmedGuard,
+            NoVisibleGuard,
+        },
     },
     rustc_span::Span,
     std::path::{
@@ -27,8 +32,22 @@ fn binding_key(tcx: TyCtxt<'_>, span: Span) -> Option<String> {
 }
 
 pub fn def_key(tcx: TyCtxt<'_>, def_id: DefId) -> String {
-    let hash = tcx.def_path_hash(def_id);
-    return format!("def:{:x}:{:x}", hash.stable_crate_id().as_u64(), hash.local_hash().as_u64());
+    let path = {
+        let _no_trimmed = NoTrimmedGuard::new();
+        let _no_visible = NoVisibleGuard::new();
+        let _crate_name = CrateNamePrefixGuard::new();
+        tcx.def_path_str(def_id)
+    };
+    let flavor = if !def_id.is_local() {
+        "lib"
+    } else if tcx.sess.is_test_crate() {
+        "test"
+    } else if tcx.crate_types().contains(&rustc_session::config::CrateType::Executable) {
+        "bin"
+    } else {
+        "lib"
+    };
+    return format!("def:{}:{}", flavor, path);
 }
 
 pub fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, usize, usize)> {

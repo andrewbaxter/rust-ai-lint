@@ -15,6 +15,11 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use {
+    aargvark::{
+        Aargvark,
+        traits_impls::NotFlag,
+        vark,
+    },
     crate::wire::{
         Def,
         OUT_DIR_ENV,
@@ -49,8 +54,15 @@ use {
     },
 };
 
-const USAGE: &str =
-    "Usage: rust-ai-lint [--against <rev>]\n\nChecks every cargo project under the current directory, restores the\ncomments of every tracked rust file to what they were at <rev> (default\nHEAD), and puts every tracked markdown file back the way it was at <rev>.\nWhen git is committing (GIT_INDEX_FILE is set) it reads and fixes what is\nstaged, otherwise it reads and fixes the working tree. Every check is run;\nnone of them can be turned off.";
+#[derive(Aargvark)]
+struct Args {
+    against: Option<String>,
+    features: Option<Vec<NotFlag>>,
+    all_features: Option<()>,
+    no_default_features: Option<()>,
+}
+
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 fn cargo() -> PathBuf {
     return std::env::var_os("CARGO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cargo"));
@@ -180,20 +192,9 @@ fn main() {
         return;
     }
     match (|| -> Result<i32, String> {
-        let mut against = "HEAD".to_string();
-        let mut argv = std::env::args().skip(1);
-        while let Some(arg) = argv.next() {
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    println!("{}", USAGE);
-                    exit(0);
-                },
-                "--against" => {
-                    against = argv.next().ok_or_else(|| format!("--against needs a revision\n\n{}", USAGE))?;
-                },
-                other => return Err(format!("unrecognized argument `{}`\n\n{}", other, USAGE)),
-            }
-        }
+        let args = vark::<Args>();
+        let against = args.against.unwrap_or_else(|| "HEAD".to_string());
+        let features: Vec<String> = args.features.unwrap_or_default().into_iter().map(|f| f.0).collect();
         let root = std::env::current_dir().map_err(|e| format!("cannot read the current directory: {}", e))?;
         let mut problems: Vec<Problem> = vec![];
         let repo = PathBuf::from(git(&root, &["rev-parse", "--show-toplevel"])?.trim());
@@ -342,6 +343,29 @@ fn main() {
                     group.remove(spot.index);
                 }
                 let parsed = syn::parse2::<syn::File>(tokens).map_err(|e| format!("cannot be parsed: {}", e))?;
+                let mut old_docs = BTreeMap::<String, usize>::new();
+                if let Some(old) = was.get(path) {
+                    let old_parsed =
+                        extract_whitespaces(config.keep_max_blank_lines, old)
+                            .ok()
+                            .and_then(|(_, tokens)| syn::parse2::<syn::File>(tokens).ok());
+                    for (text, _) in old_parsed.iter().flat_map(comments::doc_attributes) {
+                        *old_docs.entry(text).or_default() += 1;
+                    }
+                }
+                for (text, line) in comments::doc_attributes(&parsed) {
+                    match old_docs.get_mut(&text) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1;
+                        },
+                        _ => problems.push(Problem {
+                            check: "comments".to_string(),
+                            path: path.to_string(),
+                            line: line,
+                            message: "doc attributes can't be added or changed, the same as comments; remove it".to_string(),
+                        }),
+                    }
+                }
                 let done =
                     format_ast(parsed, &config, whitespaces).map_err(|e| format!("cannot be formatted: {}", e))?;
                 if !done.lost_comments.is_empty() {
@@ -377,7 +401,7 @@ fn main() {
         if manifests.is_empty() {
             return Err(format!("no cargo project found under {}", root.display()));
         }
-        let mut workspaces: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        let mut workspaces: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<Option<String>>>> = BTreeMap::new();
         for manifest in manifests {
             let out =
                 Command::new(cargo())
@@ -403,12 +427,36 @@ fn main() {
                     .get("workspace_root")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| format!("cargo metadata in {} has no workspace_root", manifest.display()))?;
-            let mut members = BTreeSet::new();
+            let mut members = BTreeMap::new();
             for package in meta.get("packages").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
                 let Some(name) = package.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                members.insert(name.to_string());
+                let mut targets = BTreeSet::new();
+                let mut native = true;
+                for dep in package.get("dependencies").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
+                    if dep.get("kind").is_some_and(|k| !k.is_null()) {
+                        continue;
+                    }
+                    match dep.get("target").and_then(|v| v.as_str()) {
+                        None => {
+                            let dep_name = dep.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if ["wasm-bindgen", "js-sys", "web-sys"].contains(&dep_name) {
+                                native = false;
+                                targets.insert(Some(WASM_TARGET.to_string()));
+                            }
+                        },
+                        Some(platform) => {
+                            if platform.contains("wasm32") {
+                                targets.insert(Some(WASM_TARGET.to_string()));
+                            }
+                        },
+                    }
+                }
+                if native {
+                    targets.insert(None);
+                }
+                members.insert(name.to_string(), targets);
             }
             workspaces.insert(PathBuf::from(workspace_root), members);
         }
@@ -418,23 +466,52 @@ fn main() {
         let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {}", e))?;
         for (workspace_root, members) in &workspaces {
             let target = workspace_root.join("target").join("rust-ai-lint");
-            clear_members(&target, members, 0);
-            let status =
-                Command::new(cargo())
-                    .current_dir(workspace_root)
-                    .args(["check", "--workspace", "--all-targets", "--quiet"])
-                    .env("RUSTC_WORKSPACE_WRAPPER", &exe)
-                    .env("CARGO_TARGET_DIR", &target)
-                    .env(OUT_DIR_ENV, &out_dir)
-                    .status()
-                    .map_err(|e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e))?;
-            if !status.success() {
-                return Err(
-                    format!(
-                        "{} does not compile, so it cannot be checked; fix the build errors above first",
-                        workspace_root.display()
-                    ),
-                );
+            clear_members(&target, &members.keys().cloned().collect(), 0);
+            let mut groups: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+            for (member, member_targets) in members {
+                for member_target in member_targets {
+                    groups.entry(member_target.clone()).or_default().insert(member.clone());
+                }
+            }
+            for (group_target, packages) in &groups {
+                let mut command = Command::new(cargo());
+                command.current_dir(workspace_root).args(["check", "--all-targets", "--quiet"]);
+                for package in packages {
+                    command.args(["-p", package]);
+                }
+                if let Some(group_target) = group_target {
+                    command.args(["--target", group_target]);
+                }
+                for feature in &features {
+                    let other_member = feature.split_once('/').is_some_and(|(package, _)| {
+                        return members.contains_key(package) && !packages.contains(package);
+                    });
+                    if !other_member {
+                        command.args(["--features", feature]);
+                    }
+                }
+                if args.all_features.is_some() {
+                    command.arg("--all-features");
+                }
+                if args.no_default_features.is_some() {
+                    command.arg("--no-default-features");
+                }
+                let status =
+                    command
+                        .env("RUSTC_WORKSPACE_WRAPPER", &exe)
+                        .env("CARGO_TARGET_DIR", &target)
+                        .env(OUT_DIR_ENV, &out_dir)
+                        .status()
+                        .map_err(|e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e))?;
+                if !status.success() {
+                    return Err(
+                        format!(
+                            "{} does not compile for {}, so it cannot be checked; fix the build errors above first",
+                            workspace_root.display(),
+                            group_target.as_deref().unwrap_or("the default target")
+                        ),
+                    );
+                }
             }
         }
         let mut defs: Vec<Def> = vec![];

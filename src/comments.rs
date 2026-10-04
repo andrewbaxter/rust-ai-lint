@@ -134,3 +134,51 @@ pub fn pairs<
     gap(&mut out, old_at .. old.len(), new_at .. new.len());
     return out;
 }
+
+struct DocAttributes {
+    found: Vec<(String, usize)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for DocAttributes {
+    fn visit_attribute(&mut self, attribute: &'ast syn::Attribute) {
+        let mut metas = vec![attribute.meta.clone()];
+        let mut carries_text = false;
+        while let Some(meta) = metas.pop() {
+            match meta {
+                syn::Meta::NameValue(value) => {
+                    carries_text |= value.path.is_ident("doc");
+                },
+                syn::Meta::List(list) => {
+                    if !list.path.is_ident("cfg_attr") {
+                        continue;
+                    }
+                    let Ok(nested) =
+                        list.parse_args_with(
+                            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                        ) else {
+                            continue;
+                        };
+                    metas.extend(nested.into_iter().skip(1));
+                },
+                syn::Meta::Path(_) => { },
+            }
+        }
+        if carries_text {
+            self
+                .found
+                .push(
+                    (
+                        collapse(&quote::ToTokens::to_token_stream(attribute).to_string()),
+                        syn::spanned::Spanned::span(attribute).start().line,
+                    ),
+                );
+        }
+        syn::visit::visit_attribute(self, attribute);
+    }
+}
+
+pub fn doc_attributes(file: &syn::File) -> Vec<(String, usize)> {
+    let mut visitor = DocAttributes { found: vec![] };
+    syn::visit::Visit::visit_file(&mut visitor, file);
+    return visitor.found;
+}
