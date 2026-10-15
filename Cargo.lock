@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "aargvark"
-version = "0.12.4"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ccfa23fedca283ae0697b7918ad64fcca75d294ee6503d14e06134e28eb831"
+checksum = "6bd6f080f6603f0af7aab5c926ee05673b2a20daa5e27729476201687c4715e8"
 dependencies = [
  "aargvark_proc_macros",
  "comfy-table",
@@ -19,9 +19,9 @@ dependencies = [
 
 [[package]]
 name = "aargvark_proc_macros"
-version = "3.8.4"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e7db0ebc926c250b4d5788f7c44eed2c99c497717ee8140bd5a3218e4a2b13f"
+checksum = "107173b153fd6c2a269f99711d6008259373a570586d940326c9f32304de0fed"
 dependencies = [
  "convert_case 0.8.0",
  "darling",
@@ -357,9 +357,8 @@ dependencies = [
 
 [[package]]
 name = "genemichaels-lib"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "329a4d848485585d6c2c3f024ffbe88d2286d3a9506de4703c7c494e44925a38"
+version = "0.12.0"
+source = "git+https://github.com/andrewbaxter/genemichaels?branch=fuzz#947fbc6c55fcdc50cad24f386d1b75b6861dfa8c"
 dependencies = [
  "cargo-manifest",
  "derive_more",
@@ -494,9 +493,9 @@ dependencies = [
 
 [[package]]
 name = "markdown"
-version = "1.0.0-alpha.21"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6491e6c702bf7e3b24e769d800746d5f2c06a6c6a2db7992612e0f429029e81"
+checksum = "a5cab8f2cadc416a82d2e783a1946388b31654d391d1c7d92cc1f03e295b1deb"
 dependencies = [
  "unicode-id",
 ]

@@ -7,7 +7,12 @@ pkgs.rustPlatform.buildRustPackage {
   pname = "rust-ai-lint";
   version = "0.2.0";
   src = ./.;
-  cargoLock.lockFile = ./Cargo.lock;
+  cargoLock = {
+    lockFile = ./Cargo.lock;
+    outputHashes = {
+      "genemichaels-lib-0.12.0" = "sha256-9QMUCgDyCaxF0rvCmb+EHZ3D8OyysbAzXP4WBmgxe58=";
+    };
+  };
 
   RUSTC_BOOTSTRAP = 1;
   RUSTFLAGS = "-L native=${llvm}/lib";

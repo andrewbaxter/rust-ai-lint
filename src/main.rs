@@ -262,7 +262,7 @@ fn main() {
                         (Some(&source[..end]), &source[end..])
                     },
                 };
-                let (mut whitespaces, tokens) =
+                let (mut whitespaces, block_whitespaces, tokens) =
                     extract_whitespaces(
                         config.keep_max_blank_lines,
                         body,
@@ -282,7 +282,7 @@ fn main() {
                 let before = match was.get(path) {
                     None => vec![],
                     Some(old) => {
-                        let (whitespaces, _) =
+                        let (whitespaces, _, _) =
                             extract_whitespaces(
                                 config.keep_max_blank_lines,
                                 old,
@@ -348,7 +348,7 @@ fn main() {
                     let old_parsed =
                         extract_whitespaces(config.keep_max_blank_lines, old)
                             .ok()
-                            .and_then(|(_, tokens)| syn::parse2::<syn::File>(tokens).ok());
+                            .and_then(|(_, _, tokens)| syn::parse2::<syn::File>(tokens).ok());
                     for (text, _) in old_parsed.iter().flat_map(comments::doc_attributes) {
                         *old_docs.entry(text).or_default() += 1;
                     }
@@ -367,7 +367,12 @@ fn main() {
                     }
                 }
                 let done =
-                    format_ast(parsed, &config, whitespaces).map_err(|e| format!("cannot be formatted: {}", e))?;
+                    format_ast(
+                        parsed,
+                        &config,
+                        whitespaces,
+                        block_whitespaces,
+                    ).map_err(|e| format!("cannot be formatted: {}", e))?;
                 if !done.lost_comments.is_empty() {
                     return Err(
                         format!(
@@ -498,6 +503,7 @@ fn main() {
                 }
                 let status =
                     command
+                        .env("RUSTC_BOOTSTRAP", "1")
                         .env("RUSTC_WORKSPACE_WRAPPER", &exe)
                         .env("CARGO_TARGET_DIR", &target)
                         .env(OUT_DIR_ENV, &out_dir)
