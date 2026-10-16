@@ -262,7 +262,7 @@ fn main() {
                         (Some(&source[..end]), &source[end..])
                     },
                 };
-                let (mut whitespaces, block_whitespaces, tokens) =
+                let (mut whitespaces, mut block_whitespaces, tokens) =
                     extract_whitespaces(
                         config.keep_max_blank_lines,
                         body,
@@ -278,16 +278,16 @@ fn main() {
                         }
                     }
                 }
-                let spots = comments::walk(&whitespaces, body);
+                let spots = comments::walk(&whitespaces, &block_whitespaces, body);
                 let before = match was.get(path) {
                     None => vec![],
                     Some(old) => {
-                        let (whitespaces, _, _) =
+                        let (whitespaces, block_whitespaces, _) =
                             extract_whitespaces(
                                 config.keep_max_blank_lines,
                                 old,
                             ).map_err(|e| format!("cannot be read: {}", e))?;
-                        comments::walk(&whitespaces, old)
+                        comments::walk(&whitespaces, &block_whitespaces, old)
                     },
                 };
                 let anchored = comments::pairs(&before, &spots, |old, new| return old.code == new.code, |old, new| {
@@ -297,10 +297,15 @@ fn main() {
                     return most > 0 && left.intersection(&right).count() * 2 >= most;
                 });
                 let mut restore = vec![];
-                let mut remove = vec![];
+                let mut remove = BTreeSet::new();
+                let mut inserts = vec![];
+                let mut used = BTreeSet::new();
                 for (into, spot) in spots.iter().enumerate() {
                     let older: &[genemichaels_lib::Comment] = match anchored[into] {
-                        Some(from) => &before[from].comments,
+                        Some(from) => {
+                            used.insert(from);
+                            &before[from].comments
+                        },
                         None => &[],
                     };
                     let matched =
@@ -311,36 +316,123 @@ fn main() {
                                 comments::collapse(&old.lines) == comments::collapse(&new.lines),
                             |old, new| return old.mode == new.mode,
                         );
+                    let mut kept = vec![
+                        None;
+                        older.len()
+                    ];
                     for (index, comment) in spot.comments.iter().enumerate() {
                         let Some(from) = matched[index] else {
-                            remove.push((into, index));
+                            remove.insert((spot.at[index].inner, spot.at[index].key, spot.at[index].index));
                             continue;
                         };
+                        kept[from] = Some(index);
                         if comments::collapse(&older[from].lines) == comments::collapse(&comment.lines) {
                             continue;
                         }
                         restore.push((into, index, older[from].clone()));
                     }
+                    for (from, comment) in older.iter().enumerate() {
+                        if kept[from].is_some() {
+                            continue;
+                        }
+                        let pos = match kept[..from].iter().rev().flatten().next() {
+                            Some(index) => spot.at[*index].index + 1,
+                            None => spot.at[kept[from..].iter().flatten().next().copied().unwrap_or(0)].index,
+                        };
+                        inserts.push(comments::Insert {
+                            inner: spot.at[0].inner,
+                            key: spot.at[0].key,
+                            pos: pos,
+                            comment: comment.clone(),
+                            relocated: false,
+                        });
+                    }
+                }
+                if let Some(old) = was.get(path) {
+                    let taken =
+                        spots
+                            .iter()
+                            .enumerate()
+                            .filter(|(into, _)| anchored[*into].is_some())
+                            .map(|(_, spot)| (spot.at[0].inner, spot.at[0].key))
+                            .collect::<BTreeSet<_>>();
+                    for (from, spot) in before.iter().enumerate() {
+                        if used.contains(&from) {
+                            continue;
+                        }
+                        let inner = spot.at[0].inner;
+                        let Some(key) = (|| -> Option<genemichaels_lib::HashLineColumn> {
+                            if spot.at[0].key.0.line == 0 {
+                                return Some(spot.at[0].key);
+                            }
+                            let old_lines = old.lines().collect::<Vec<_>>();
+                            let new_lines = body.lines().collect::<Vec<_>>();
+                            let line = [false, true].into_iter().find_map(|context| {
+                                let label = |lines: &[&str], line: usize| {
+                                    let mut out = match inner {
+                                        true => comments::collapse(lines[line - 1]),
+                                        false => comments::anchor(lines, line),
+                                    };
+                                    if context {
+                                        let before =
+                                            lines[..line - 1].iter().map(|text| text.trim()).rev().find(|text| {
+                                                return !text.is_empty() && !text.starts_with("//");
+                                            });
+                                        out = format!("{}\n{}", before.unwrap_or(""), out);
+                                    }
+                                    return out;
+                                };
+                                let code = label(&old_lines, spot.at[0].key.0.line);
+                                let mut found =
+                                    (1 ..= new_lines.len()).filter(|line| label(&new_lines, *line) == code);
+                                let line = found.next()?;
+                                if found.next().is_some() ||
+                                    (1 ..= old_lines.len())
+                                        .filter(|line| label(&old_lines, *line) == code)
+                                        .count() !=
+                                        1 {
+                                    return None;
+                                }
+                                return Some(line);
+                            })?;
+                            let was = old_lines[spot.at[0].key.0.line - 1];
+                            let now = new_lines[line - 1];
+                            if was.trim() != now.trim() {
+                                return None;
+                            }
+                            let indent = |text: &str| text.chars().count() - text.trim_start().chars().count();
+                            let mut moved = spot.at[0].key;
+                            moved.0.line = line;
+                            moved.0.column = (spot.at[0].key.0.column + indent(now)).checked_sub(indent(was))?;
+                            return Some(moved);
+                        })() else {
+                            continue;
+                        };
+                        if taken.contains(&(inner, key)) {
+                            continue;
+                        }
+                        for comment in &spot.comments {
+                            inserts.push(comments::Insert {
+                                inner: inner,
+                                key: key,
+                                pos: usize::MAX,
+                                comment: comment.clone(),
+                                relocated: true,
+                            });
+                        }
+                    }
                 }
                 for (into, index, older) in restore {
                     let spot = &spots[into].at[index];
-                    let group =
-                        whitespaces.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
+                    let group = match spot.inner {
+                        true => &mut block_whitespaces,
+                        false => &mut whitespaces,
+                    }.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
                     let WhitespaceMode::Comment(comment) = &mut group[spot.index].mode else {
                         return Err("a comment left its anchor".to_string());
                     };
                     comment.lines = older.lines;
                     comment.mode = older.mode;
-                }
-                remove.sort_by_key(|(into, index)| {
-                    let spot = &spots[*into].at[*index];
-                    return std::cmp::Reverse((spot.key, spot.index));
-                });
-                for (into, index) in remove {
-                    let spot = &spots[into].at[index];
-                    let group =
-                        whitespaces.get_mut(&spot.key).ok_or_else(|| "a comment left its anchor".to_string())?;
-                    group.remove(spot.index);
                 }
                 let parsed = syn::parse2::<syn::File>(tokens).map_err(|e| format!("cannot be parsed: {}", e))?;
                 let mut old_docs = BTreeMap::<String, usize>::new();
@@ -366,13 +458,63 @@ fn main() {
                         }),
                     }
                 }
-                let done =
-                    format_ast(
-                        parsed,
+                let format = |relocated: bool| {
+                    let mut whitespaces = whitespaces.clone();
+                    let mut block_whitespaces = block_whitespaces.clone();
+                    for inner in [false, true] {
+                        let chosen =
+                            inserts
+                                .iter()
+                                .filter(|insert| insert.inner == inner && (relocated || !insert.relocated))
+                                .collect::<Vec<_>>();
+                        let removed =
+                            remove
+                                .iter()
+                                .filter(|(at_inner, _, _)| *at_inner == inner)
+                                .map(|(_, key, index)| (*key, *index))
+                                .collect::<BTreeSet<_>>();
+                        let map = match inner {
+                            true => &mut block_whitespaces,
+                            false => &mut whitespaces,
+                        };
+                        let keys =
+                            removed
+                                .iter()
+                                .map(|(key, _)| *key)
+                                .chain(chosen.iter().map(|insert| insert.key))
+                                .collect::<BTreeSet<_>>();
+                        for key in keys {
+                            let old = map.remove(&key).unwrap_or_default();
+                            let mut new = vec![];
+                            for pos in 0 ..= old.len() {
+                                for insert in chosen
+                                    .iter()
+                                    .filter(|insert| insert.key == key && insert.pos.min(old.len()) == pos) {
+                                    new.push(genemichaels_lib::Whitespace {
+                                        loc: key.0,
+                                        mode: WhitespaceMode::Comment(insert.comment.clone()),
+                                    });
+                                }
+                                if pos < old.len() && !removed.contains(&(key, pos)) {
+                                    new.push(old[pos].clone());
+                                }
+                            }
+                            if !new.is_empty() {
+                                map.insert(key, new);
+                            }
+                        }
+                    }
+                    return format_ast(
+                        parsed.clone(),
                         &config,
                         whitespaces,
                         block_whitespaces,
-                    ).map_err(|e| format!("cannot be formatted: {}", e))?;
+                    ).map_err(|e| format!("cannot be formatted: {}", e));
+                };
+                let mut done = format(true)?;
+                if !done.lost_comments.is_empty() && inserts.iter().any(|insert| insert.relocated) {
+                    done = format(false)?;
+                }
                 if !done.lost_comments.is_empty() {
                     return Err(
                         format!(

@@ -12,6 +12,7 @@ use {
 pub struct At {
     pub index: usize,
     pub key: HashLineColumn,
+    pub inner: bool,
 }
 
 pub struct Spot {
@@ -24,15 +25,48 @@ pub fn collapse(text: &str) -> String {
     return text.split_whitespace().collect::<Vec<_>>().join(" ");
 }
 
-pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str) -> Vec<Spot> {
+pub fn anchor(lines: &[&str], line: usize) -> String {
+    let mut taken = vec![];
+    for at in line - 1 .. (line + 8).min(lines.len()) {
+        let text = lines[at].trim();
+        taken.push(text);
+        if !text.starts_with('#') {
+            break;
+        }
+    }
+    return collapse(&taken.join(" "));
+}
+
+pub struct Insert {
+    pub inner: bool,
+    pub key: HashLineColumn,
+    pub pos: usize,
+    pub comment: Comment,
+    pub relocated: bool,
+}
+
+pub fn walk(
+    whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>,
+    block_whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>,
+    text: &str,
+) -> Vec<Spot> {
     let lines = text.lines().collect::<Vec<_>>();
     let mut out = vec![];
-    let ordered =
+    let mut ordered =
         whitespaces
             .iter()
-            .filter(|(key, _)| key.0.line != 0)
-            .chain(whitespaces.iter().filter(|(key, _)| key.0.line == 0));
-    for (key, group) in ordered {
+            .map(|(key, group)| (key, group, false))
+            .chain(block_whitespaces.iter().map(|(key, group)| (key, group, true)))
+            .collect::<Vec<_>>();
+    ordered.sort_by_key(|(key, _, inner)| {
+        let place = match (key.0.line, inner) {
+            (0, true) => 0,
+            (0, false) => 2,
+            _ => 1,
+        };
+        return (place, **key, *inner);
+    });
+    for (key, group, inner) in ordered {
         let mut at = vec![];
         let mut comments = vec![];
         for (index, whitespace) in group.iter().enumerate() {
@@ -48,25 +82,18 @@ pub fn walk(whitespaces: &BTreeMap<HashLineColumn, Vec<Whitespace>>, text: &str)
             at.push(At {
                 key: *key,
                 index: index,
+                inner: inner,
             });
             comments.push(comment.clone());
         }
         if comments.is_empty() {
             continue;
         }
-        let code = match key.0.line {
-            0 => "\u{0}end of file".to_string(),
-            line => {
-                let mut taken = vec![];
-                for at in line - 1 .. (line + 8).min(lines.len()) {
-                    let text = lines[at].trim();
-                    taken.push(text);
-                    if !text.starts_with('#') {
-                        break;
-                    }
-                }
-                collapse(&taken.join(" "))
-            },
+        let code = match (key.0.line, inner) {
+            (0, true) => "\u{0}start of file".to_string(),
+            (0, false) => "\u{0}end of file".to_string(),
+            (line, true) => format!("\u{0}inside {}", collapse(lines[line - 1])),
+            (line, false) => anchor(&lines, line),
         };
         out.push(Spot {
             at: at,
