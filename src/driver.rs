@@ -274,11 +274,16 @@ impl rustc_driver::Callbacks for Callbacks {
                     path: path,
                     line: line,
                     exempt: exempt,
-                    inlinable: matches!(
-                        kind,
-                        DefKind::Fn | DefKind::AssocFn | DefKind::Const { .. } | DefKind::AssocConst { .. } |
-                            DefKind::Static { .. }
-                    ),
+                    inlinable: match kind {
+                        DefKind::Fn | DefKind::AssocFn | DefKind::Const { .. } | DefKind::AssocConst { .. } => true,
+                        DefKind::Static { mutability: rustc_ast::Mutability::Not, .. } => {
+                            tcx
+                                .type_of(def_id)
+                                .instantiate_identity()
+                                .is_freeze(tcx, rustc_middle::ty::TypingEnv::post_analysis(tcx, def_id))
+                        },
+                        _ => false,
+                    },
                 });
             }
         }
