@@ -560,8 +560,12 @@ fn main() {
         }
         let mut sites: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut functions: HashMap<String, Vec<String>> = HashMap::new();
         for use_ in uses {
             sites.entry(use_.key.clone()).or_default().insert(use_.site.clone());
+            let common = functions.entry(use_.key.clone()).or_insert_with(|| use_.functions.clone());
+            let shared = common.iter().zip(&use_.functions).take_while(|(a, b)| a == b).count();
+            common.truncate(shared);
             let site_path = use_.site.rsplitn(3, ':').last().unwrap_or("");
             if !use_.generated && ours(site_path) {
                 written.entry(use_.key).or_default().insert(use_.site);
@@ -577,11 +581,20 @@ fn main() {
             }
             let total = sites.get(&def.key).map(|s| s.len()).unwrap_or(0);
             let by_hand = written.get(&def.key).map(|s| s.len()).unwrap_or(0);
+            let home =
+                functions
+                    .get(&def.key)
+                    .filter(|_| def.movable && total == by_hand)
+                    .and_then(|common| common.last().cloned());
             let message;
             if total == 0 {
                 message = format!("{} `{}` is never used; delete it", def.kind, def.name);
             } else if def.inlinable && total == 1 && by_hand == 1 {
                 message = format!("{} `{}` is used exactly once; inline it into its one caller", def.kind, def.name);
+            } else if let Some(function) = home {
+                let function = function.splitn(3, ':').nth(2).unwrap_or(&function).to_string();
+                message =
+                    format!("{} `{}` is only used in `{}`; move it into that function", def.kind, def.name, function);
             } else {
                 continue;
             }

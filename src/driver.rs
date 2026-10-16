@@ -267,6 +267,23 @@ impl rustc_driver::Callbacks for Callbacks {
                     }
                     return tcx.effective_visibilities(()).is_exported(def_id);
                 })();
+                let (inlinable, movable) = match kind {
+                    DefKind::Fn | DefKind::AssocFn | DefKind::Const { .. } | DefKind::AssocConst { .. } => (
+                        true,
+                        false,
+                    ),
+                    DefKind::Static { mutability, .. } => {
+                        let plain_data =
+                            mutability == rustc_ast::Mutability::Not &&
+                                tcx
+                                    .type_of(def_id)
+                                    .instantiate_identity()
+                                    .is_freeze(tcx, rustc_middle::ty::TypingEnv::post_analysis(tcx, def_id));
+                        let global = tcx.def_kind(tcx.parent(def_id.to_def_id())) == DefKind::Mod;
+                        (plain_data, !plain_data && global)
+                    },
+                    _ => (false, false),
+                };
                 report.defs.push(Def {
                     key: def_key(tcx, def_id.to_def_id()),
                     kind: described.to_string(),
@@ -274,16 +291,8 @@ impl rustc_driver::Callbacks for Callbacks {
                     path: path,
                     line: line,
                     exempt: exempt,
-                    inlinable: match kind {
-                        DefKind::Fn | DefKind::AssocFn | DefKind::Const { .. } | DefKind::AssocConst { .. } => true,
-                        DefKind::Static { mutability: rustc_ast::Mutability::Not, .. } => {
-                            tcx
-                                .type_of(def_id)
-                                .instantiate_identity()
-                                .is_freeze(tcx, rustc_middle::ty::TypingEnv::post_analysis(tcx, def_id))
-                        },
-                        _ => false,
-                    },
+                    inlinable: inlinable,
+                    movable: movable,
                 });
             }
         }

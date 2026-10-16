@@ -12,6 +12,7 @@ pub struct Def {
     pub key: String,
     pub kind: String,
     pub line: usize,
+    pub movable: bool,
     pub name: String,
     pub path: String,
 }
@@ -33,6 +34,7 @@ pub struct Report {
 
 #[derive(Serialize, Deserialize)]
 pub struct Use {
+    pub functions: Vec<String>,
     pub generated: bool,
     pub key: String,
     pub site: String,

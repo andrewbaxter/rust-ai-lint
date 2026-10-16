@@ -6,7 +6,11 @@ use {
         Use,
     },
     rustc_hir::{
-        def::Res,
+        HirId,
+        def::{
+            DefKind,
+            Res,
+        },
         def_id::DefId,
         intravisit::Visitor,
     },
@@ -82,27 +86,37 @@ pub struct Walk<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Walk<'a, 'tcx> {
-    fn record(&mut self, key: String, span: Span) {
+    fn record(&mut self, key: String, span: Span, at: HirId) {
         let site = match place(self.tcx, span) {
             Some((path, line, col)) => format!("{}:{}:{}", path, line, col),
             None => format!("{:?}", span),
         };
         let generated = self.generated || span.from_expansion();
+        let mut functions = vec![];
+        let mut scope = Some(at.owner.def_id);
+        while let Some(def_id) = scope {
+            if matches!(self.tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
+                functions.push(def_key(self.tcx, def_id.to_def_id()));
+            }
+            scope = self.tcx.opt_local_parent(def_id);
+        }
+        functions.reverse();
         self.report.uses.push(Use {
+            functions: functions,
             key: key,
             site: site,
             generated: generated,
         });
     }
 
-    fn record_def(&mut self, def_id: DefId, span: Span) {
+    fn record_def(&mut self, def_id: DefId, span: Span, at: HirId) {
         let key = def_key(self.tcx, def_id);
-        self.record(key, span);
+        self.record(key, span, at);
     }
 
-    fn record_res(&mut self, res: Res, span: Span) {
+    fn record_res(&mut self, res: Res, span: Span, at: HirId) {
         match res {
-            Res::Def(_, def_id) => self.record_def(def_id, span),
+            Res::Def(_, def_id) => self.record_def(def_id, span, at),
             Res::Local(hir_id) => {
                 let rustc_hir::Node::Pat(pat) = self.tcx.hir_node(hir_id) else {
                     return;
@@ -113,7 +127,7 @@ impl<'a, 'tcx> Walk<'a, 'tcx> {
                 let Some(key) = binding_key(self.tcx, ident.span) else {
                     return;
                 };
-                self.record(key, span);
+                self.record(key, span, at);
             },
             _ => { },
         }
@@ -185,11 +199,11 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                 let rustc_hir::ExprKind::Path(ref qpath) = expr.kind else {
                     unreachable!();
                 };
-                self.record_res(typeck.qpath_res(qpath, expr.hir_id), expr.span);
+                self.record_res(typeck.qpath_res(qpath, expr.hir_id), expr.span, expr.hir_id);
             },
             rustc_hir::ExprKind::MethodCall(segment, ..) => {
                 match typeck.type_dependent_def_id(expr.hir_id) {
-                    Some(def_id) => self.record_def(def_id, segment.ident.span),
+                    Some(def_id) => self.record_def(def_id, segment.ident.span, expr.hir_id),
                     None => self.untyped(expr.span, "a method call"),
                 }
             },
@@ -198,7 +212,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                 if let rustc_middle::ty::Adt(adt, _) = receiver_ty.peel_refs().kind() {
                     let index = typeck.field_index(expr.hir_id);
                     if let Some(field) = adt.non_enum_variant().fields.get(index) {
-                        self.record_def(field.did, ident.span);
+                        self.record_def(field.did, ident.span, expr.hir_id);
                     }
                 }
             },
@@ -210,7 +224,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                     for field in fields {
                         let index = typeck.field_index(field.hir_id);
                         if let Some(field_def) = variant.fields.get(index) {
-                            self.record_def(field_def.did, field.ident.span);
+                            self.record_def(field_def.did, field.ident.span, field.hir_id);
                         }
                     }
                 }
@@ -264,6 +278,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                         line: line,
                         exempt: exempt,
                         inlinable: false,
+                        movable: false,
                     });
                 }
             }
@@ -271,8 +286,8 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
         rustc_hir::intravisit::walk_pat(self, pat);
     }
 
-    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, _id: rustc_hir::HirId) {
-        self.record_res(path.res, path.span);
+    fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, id: HirId) {
+        self.record_res(path.res, path.span, id);
         rustc_hir::intravisit::walk_path(self, path);
     }
 
