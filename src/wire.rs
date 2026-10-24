@@ -38,4 +38,5 @@ pub struct Use {
     pub generated: bool,
     pub key: String,
     pub site: String,
+    pub test: bool,
 }

@@ -101,11 +101,13 @@ impl<'a, 'tcx> Walk<'a, 'tcx> {
             scope = self.tcx.opt_local_parent(def_id);
         }
         functions.reverse();
+        let test = self.tcx.sess.is_test_crate() && key.starts_with("def:");
         self.report.uses.push(Use {
             functions: functions,
             key: key,
             site: site,
             generated: generated,
+            test: test,
         });
     }
 

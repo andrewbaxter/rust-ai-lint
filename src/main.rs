@@ -703,7 +703,18 @@ fn main() {
         let mut sites: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut functions: HashMap<String, Vec<String>> = HashMap::new();
+        let mut test_sites: HashMap<String, BTreeSet<String>> = HashMap::new();
         for use_ in uses {
+            if use_.test {
+                let keys = match use_.key.strip_prefix("def:test:") {
+                    Some(path) => vec![format!("def:lib:{}", path), format!("def:bin:{}", path)],
+                    None => vec![use_.key.clone()],
+                };
+                for key in keys {
+                    test_sites.entry(key).or_default().insert(use_.site.clone());
+                }
+                continue;
+            }
             sites.entry(use_.key.clone()).or_default().insert(use_.site.clone());
             let common = functions.entry(use_.key.clone()).or_insert_with(|| use_.functions.clone());
             let shared = common.iter().zip(&use_.functions).take_while(|(a, b)| a == b).count();
@@ -731,6 +742,10 @@ fn main() {
             let message;
             if total == 0 {
                 message = format!("{} `{}` is never used; delete it", def.kind, def.name);
+            } else if test_sites
+                .get(&def.key)
+                .is_some_and(|s| s.iter().any(|site| !sites[&def.key].contains(site))) {
+                continue;
             } else if def.inlinable && total == 1 && by_hand == 1 {
                 message = format!("{} `{}` is used exactly once; inline it into its one caller", def.kind, def.name);
             } else if let Some(function) = home {
