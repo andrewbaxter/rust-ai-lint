@@ -180,7 +180,9 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
             return Some(self.tcx.typeck(root));
         })();
         let Some(typeck) = typeck else {
-            self.untyped(expr.span, "an expression");
+            if self.in_const_arg == 0 {
+                self.untyped(expr.span, "an expression");
+            }
             rustc_hir::intravisit::walk_expr(self, expr);
             return;
         };
