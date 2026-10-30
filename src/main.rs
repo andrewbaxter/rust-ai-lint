@@ -97,26 +97,25 @@ fn clear_members(dir: &Path, members: &BTreeSet<String>, depth: usize) {
     }
 }
 
-fn find_manifests(dir: &Path, found: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    if dir.join("Cargo.toml").is_file() {
-        found.push(dir.to_path_buf());
+fn report(mut problems: Vec<Problem>, root: &Path) -> i32 {
+    for problem in &mut problems {
+        problem.path =
+            Path::new(&problem.path)
+                .strip_prefix(root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| problem.path.clone());
     }
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "target" || name.starts_with('.') {
-            continue;
-        }
-        find_manifests(&path, found);
+    problems.sort();
+    problems.dedup();
+    for problem in &problems {
+        println!("{}:{}: [{}] {}", problem.path, problem.line, problem.check, problem.message);
     }
+    if problems.is_empty() {
+        return 0;
+    }
+    println!("");
+    println!("{} problem(s)", problems.len());
+    return 1;
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -203,21 +202,48 @@ fn main() {
             return Err(format!("no commit named `{}`", against));
         }
         let committing = std::env::var_os("GIT_INDEX_FILE").is_some();
+        let relevant = |path: &str| {
+            return path.ends_with(".rs") || path.ends_with(".md") ||
+                path.rsplit('/').next() == Some("Cargo.toml");
+        };
+        let mut changed: BTreeSet<String> = BTreeSet::new();
         let mut was: BTreeMap<String, String> = BTreeMap::new();
         if known {
-            for path in git(&repo, &["ls-tree", "-r", "--name-only", "-z", &against])?.split('\0') {
-                if !path.ends_with(".rs") && !path.ends_with(".md") {
+            let mut diff = vec!["diff", "--name-status", "--no-renames", "-z"];
+            if committing {
+                diff.push("--cached");
+            }
+            diff.push(&against);
+            let listed = git(&repo, &diff)?;
+            let mut fields = listed.split('\0');
+            while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+                if !relevant(path) {
                     continue;
                 }
-                was.insert(path.to_string(), git(&repo, &["show", &format!("{}:{}", against, path)])?);
+                changed.insert(path.to_string());
+                if status != "A" && !path.ends_with("Cargo.toml") {
+                    was.insert(path.to_string(), git(&repo, &["show", &format!("{}:{}", against, path)])?);
+                }
             }
+        } else {
+            changed.extend(
+                git(&repo, &["ls-files", "-z"])?.split('\0').filter(|path| relevant(path)).map(String::from),
+            );
+        }
+        if !committing {
+            changed.extend(
+                git(&repo, &["ls-files", "--others", "--exclude-standard", "-z"])?
+                    .split('\0')
+                    .filter(|path| relevant(path))
+                    .map(String::from),
+            );
         }
         for entry in git(&repo, &["ls-files", "--stage", "-z"])?.split('\0') {
             let Some((meta, path)) = entry.split_once('\t') else {
                 continue;
             };
             let markdown = path.ends_with(".md");
-            if !path.ends_with(".rs") && !markdown {
+            if !path.ends_with(".rs") && !markdown || !changed.contains(path) {
                 continue;
             }
             let Some(mode) = meta.split_whitespace().next() else {
@@ -543,10 +569,25 @@ fn main() {
             };
             apply(&repo, path, mode, &at, &source, &rendered, committing)?;
         }
-        let mut manifests = vec![];
-        find_manifests(&root, &mut manifests);
+        let real_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let mut manifests = BTreeSet::new();
+        for path in changed.iter().filter(|path| !path.ends_with(".md")) {
+            let mut dir = repo.join(path).parent().map(Path::to_path_buf);
+            while let Some(here) = dir {
+                if !here.starts_with(&repo) {
+                    break;
+                }
+                if here.join("Cargo.toml").is_file() {
+                    if here.starts_with(&real_root) {
+                        manifests.insert(here);
+                    }
+                    break;
+                }
+                dir = here.parent().map(Path::to_path_buf);
+            }
+        }
         if manifests.is_empty() {
-            return Err(format!("no cargo project found under {}", root.display()));
+            return Ok(report(problems, &root));
         }
         let mut workspaces: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<Option<String>>>> = BTreeMap::new();
         for manifest in manifests {
@@ -762,24 +803,7 @@ fn main() {
                 message: message,
             });
         }
-        for problem in &mut problems {
-            problem.path =
-                Path::new(&problem.path)
-                    .strip_prefix(&root)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| problem.path.clone());
-        }
-        problems.sort();
-        problems.dedup();
-        for problem in &problems {
-            println!("{}:{}: [{}] {}", problem.path, problem.line, problem.check, problem.message);
-        }
-        if problems.is_empty() {
-            return Ok(0);
-        }
-        println!("");
-        println!("{} problem(s)", problems.len());
-        return Ok(1);
+        return Ok(report(problems, &root));
     })() {
         Ok(code) => exit(code),
         Err(e) => {
