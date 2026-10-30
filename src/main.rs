@@ -148,6 +148,15 @@ fn apply(
         std::fs::write(at, rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
         return Ok(());
     }
+    let hash = store(repo, path, rendered)?;
+    git(repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
+    if std::fs::read_to_string(at).is_ok_and(|text| text == source) {
+        std::fs::write(at, rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
+    }
+    return Ok(());
+}
+
+fn store(repo: &Path, path: &str, text: &str) -> Result<String, String> {
     let mut child =
         Command::new("git")
             .arg("-C")
@@ -161,18 +170,13 @@ fn apply(
         .stdin
         .take()
         .ok_or_else(|| "git hash-object took no stdin".to_string())?
-        .write_all(rendered.as_bytes())
+        .write_all(text.as_bytes())
         .map_err(|e| format!("failed to hand {} to git hash-object: {}", path, e))?;
     let out = child.wait_with_output().map_err(|e| format!("failed to run git hash-object: {}", e))?;
     if !out.status.success() {
         return Err("git hash-object failed".to_string());
     }
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    git(repo, &["update-index", "--cacheinfo", &format!("{},{},{}", mode, hash, path)])?;
-    if std::fs::read_to_string(at).is_ok_and(|text| text == source) {
-        std::fs::write(at, rendered).map_err(|e| format!("cannot write {}: {}", at.display(), e))?;
-    }
-    return Ok(());
+    return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
 }
 
 fn main() {
@@ -238,6 +242,121 @@ fn main() {
                     .map(String::from),
             );
         }
+        let current = |path: &str| -> Result<Option<String>, String> {
+            return match committing {
+                true => Ok(Some(git(&repo, &["show", &format!(":{}", path)])?)),
+                false => Ok(std::fs::read_to_string(repo.join(path)).ok()),
+            };
+        };
+        let code = |text: &str| {
+            let body = match text.starts_with("#!/") {
+                true => text.split_once('\n').map(|(_, rest)| rest).unwrap_or(""),
+                false => text,
+            };
+            return extract_whitespaces(FormatConfig::default().keep_max_blank_lines, body)
+                .ok()
+                .map(|(_, _, tokens)| tokens.to_string());
+        };
+        if known {
+            let mut steps = vec![];
+            for line in git(
+                &repo,
+                &["rev-list", "--reverse", "--no-merges", "--parents", &format!("{}..HEAD", against)],
+            )?.lines() {
+                if let Some((commit, parent)) = line.split_once(' ') {
+                    steps.push((parent.to_string(), Some(commit.to_string())));
+                }
+            }
+            steps.push(("HEAD".to_string(), None));
+            for (base, step) in steps {
+                let mut diff = vec!["diff", "--name-status", "--no-renames", "-z"];
+                if step.is_none() && committing {
+                    diff.push("--cached");
+                }
+                diff.push(&base);
+                if let Some(commit) = &step {
+                    diff.push(commit);
+                }
+                let listed = git(&repo, &diff)?;
+                let mut touched = vec![];
+                let mut fields = listed.split('\0');
+                while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+                    touched.push((status.to_string(), path.to_string()));
+                }
+                if step.is_none() && !committing {
+                    for path in git(&repo, &["ls-files", "--others", "--exclude-standard", "-z"])?.split('\0') {
+                        if !path.is_empty() {
+                            touched.push(("A".to_string(), path.to_string()));
+                        }
+                    }
+                }
+                let mut documenting = true;
+                let mut adopted = vec![];
+                for (status, path) in touched {
+                    let markdown = path.ends_with(".md");
+                    if !markdown && !(path.ends_with(".rs") && status == "M") {
+                        documenting = false;
+                        break;
+                    }
+                    let old = match status.as_str() {
+                        "A" => None,
+                        _ => Some(git(&repo, &["show", &format!("{}:{}", base, path)])?),
+                    };
+                    let new = match &step {
+                        Some(_) if status == "D" => None,
+                        Some(commit) => Some(git(&repo, &["show", &format!("{}:{}", commit, path)])?),
+                        None => current(&path)?,
+                    };
+                    if !markdown {
+                        match (old.as_deref().and_then(code), new.as_deref().and_then(code)) {
+                            (Some(before), Some(after)) if before == after => { },
+                            _ => {
+                                documenting = false;
+                                break;
+                            },
+                        }
+                    }
+                    adopted.push((path, old, new));
+                }
+                if !documenting {
+                    continue;
+                }
+                for (path, old, new) in adopted {
+                    let Some(new) = new else {
+                        continue;
+                    };
+                    match (was.get(&path), old) {
+                        (Some(ours), Some(old)) => {
+                            let ids =
+                                [ours.as_str(), &old, &new]
+                                    .into_iter()
+                                    .map(|text| store(&repo, &path, text))
+                                    .collect::<Result<Vec<_>, _>>()?;
+                            let out =
+                                Command::new("git")
+                                    .arg("-C")
+                                    .arg(&repo)
+                                    .args(["merge-file", "-p", "--object-id", &ids[0], &ids[1], &ids[2]])
+                                    .output()
+                                    .map_err(|e| format!("failed to run git merge-file: {}", e))?;
+                            match out.status.code() {
+                                Some(0) => {
+                                    was.insert(path, String::from_utf8_lossy(&out.stdout).to_string());
+                                },
+                                Some(1 ..= 127) => { },
+                                _ => return Err(
+                                    format!("git merge-file failed: {}", String::from_utf8_lossy(&out.stderr).trim()),
+                                ),
+                            }
+                        },
+                        (None, None) => {
+                            was.insert(path, new);
+                        },
+                        _ => { },
+                    }
+                }
+            }
+        }
         for entry in git(&repo, &["ls-files", "--stage", "-z"])?.split('\0') {
             let Some((meta, path)) = entry.split_once('\t') else {
                 continue;
@@ -250,12 +369,8 @@ fn main() {
                 continue;
             };
             let at = repo.join(path);
-            let source = match committing {
-                true => git(&repo, &["show", &format!(":{}", path)])?,
-                false => match std::fs::read_to_string(&at) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                },
+            let Some(source) = current(path)? else {
+                continue;
             };
             if markdown {
                 let Some(older) = was.get(path) else {

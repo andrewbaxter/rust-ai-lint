@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+lint=$(command -v rust-ai-lint || echo "$HOME/.local/bin/rust-ai-lint")
+if [ ! -x "$lint" ]; then
+    echo "pre-commit: rust-ai-lint is not installed; run ./build.sh" >&2
+    exit 1
+fi
+cd "$(git rev-parse --show-toplevel)"
+
+# this crate uses rustc_private, so its own cargo check needs the nightly gate
+export RUSTC_BOOTSTRAP=1
+exec "$lint"
