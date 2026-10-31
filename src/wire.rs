@@ -3,7 +3,11 @@ use serde::{
     Serialize,
 };
 
-pub const OUT_DIR_ENV: &str = "RUST_AI_LINT_OUT";
+pub const WRAP_ENV: &str = "RUST_AI_LINT_WRAP";
+
+pub fn report_name(extra_filename: &str) -> String {
+    return format!("rust-ai-lint{}.json", extra_filename);
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Def {

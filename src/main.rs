@@ -22,10 +22,11 @@ use {
     },
     crate::wire::{
         Def,
-        OUT_DIR_ENV,
         Problem,
         Report,
         Use,
+        WRAP_ENV,
+        report_name,
     },
     genemichaels_lib::{
         CommentMode,
@@ -40,8 +41,12 @@ use {
             BTreeSet,
             HashMap,
         },
-        ffi::OsStr,
-        io::Write,
+        io::{
+            BufRead,
+            BufReader,
+            IsTerminal,
+            Write,
+        },
         path::{
             Path,
             PathBuf,
@@ -180,7 +185,7 @@ fn store(repo: &Path, path: &str, text: &str) -> Result<String, String> {
 }
 
 fn main() {
-    let wrapping = std::env::var_os(OUT_DIR_ENV).is_some() && std::env::args_os().count() > 1;
+    let wrapping = std::env::var_os(WRAP_ENV).is_some() && std::env::args_os().count() > 1;
     if wrapping {
         let mut args: Vec<String> = std::env::args().skip(1).collect();
         if !args.iter().any(|a| a == "--sysroot" || a.starts_with("--sysroot=")) {
@@ -705,6 +710,7 @@ fn main() {
             return Ok(report(problems, &root));
         }
         let mut workspaces: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<Option<String>>>> = BTreeMap::new();
+        let mut member_ids = BTreeSet::new();
         for manifest in manifests {
             let out =
                 Command::new(cargo())
@@ -735,6 +741,9 @@ fn main() {
                 let Some(name) = package.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
+                if let Some(id) = package.get("id").and_then(|v| v.as_str()) {
+                    member_ids.insert(id.to_string());
+                }
                 let mut targets = BTreeSet::new();
                 let mut native = true;
                 for dep in package.get("dependencies").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
@@ -763,13 +772,23 @@ fn main() {
             }
             workspaces.insert(PathBuf::from(workspace_root), members);
         }
-        let out_dir = root.join("target").join("rust-ai-lint-reports");
-        let _ = std::fs::remove_dir_all(&out_dir);
-        std::fs::create_dir_all(&out_dir).map_err(|e| format!("cannot create {}: {}", out_dir.display(), e))?;
         let exe = std::env::current_exe().map_err(|e| format!("cannot find own path: {}", e))?;
+        let built_by =
+            format!("{} {:?}", exe.display(), std::fs::metadata(&exe).and_then(|meta| meta.modified()).ok());
+        let message_format = match std::io::stderr().is_terminal() {
+            true => "--message-format=json-diagnostic-rendered-ansi",
+            false => "--message-format=json",
+        };
+        let mut reports: Vec<Report> = vec![];
         for (workspace_root, members) in &workspaces {
             let target = workspace_root.join("target").join("rust-ai-lint");
-            clear_members(&target, &members.keys().cloned().collect(), 0);
+            let names = members.keys().cloned().collect();
+            let stamp = target.join("built-by");
+            if std::fs::read_to_string(&stamp).ok().as_deref() != Some(built_by.as_str()) {
+                clear_members(&target, &names, 0);
+                std::fs::create_dir_all(&target).map_err(|e| format!("cannot create {}: {}", target.display(), e))?;
+                std::fs::write(&stamp, &built_by).map_err(|e| format!("cannot write {}: {}", stamp.display(), e))?;
+            }
             let mut groups: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
             for (member, member_targets) in members {
                 for member_target in member_targets {
@@ -777,44 +796,125 @@ fn main() {
                 }
             }
             for (group_target, packages) in &groups {
-                let mut command = Command::new(cargo());
-                command.current_dir(workspace_root).args(["check", "--all-targets", "--quiet"]);
-                for package in packages {
-                    command.args(["-p", package]);
-                }
-                if let Some(group_target) = group_target {
-                    command.args(["--target", group_target]);
-                }
-                for feature in &features {
-                    let other_member = feature.split_once('/').is_some_and(|(package, _)| {
-                        return members.contains_key(package) && !packages.contains(package);
-                    });
-                    if !other_member {
-                        command.args(["--features", feature]);
+                let mut cleared = false;
+                loop {
+                    let mut command = Command::new(cargo());
+                    command.current_dir(workspace_root).args(["check", "--all-targets", "--quiet", message_format]);
+                    for package in packages {
+                        command.args(["-p", package]);
                     }
-                }
-                if args.all_features.is_some() {
-                    command.arg("--all-features");
-                }
-                if args.no_default_features.is_some() {
-                    command.arg("--no-default-features");
-                }
-                let status =
-                    command
-                        .env("RUSTC_BOOTSTRAP", "1")
-                        .env("RUSTC_WORKSPACE_WRAPPER", &exe)
-                        .env("CARGO_TARGET_DIR", &target)
-                        .env(OUT_DIR_ENV, &out_dir)
-                        .status()
-                        .map_err(|e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e))?;
-                if !status.success() {
-                    return Err(
-                        format!(
-                            "{} does not compile for {}, so it cannot be checked; fix the build errors above first",
-                            workspace_root.display(),
-                            group_target.as_deref().unwrap_or("the default target")
-                        ),
-                    );
+                    if let Some(group_target) = group_target {
+                        command.args(["--target", group_target]);
+                    }
+                    for feature in &features {
+                        let other_member = feature.split_once('/').is_some_and(|(package, _)| {
+                            return members.contains_key(package) && !packages.contains(package);
+                        });
+                        if !other_member {
+                            command.args(["--features", feature]);
+                        }
+                    }
+                    if args.all_features.is_some() {
+                        command.arg("--all-features");
+                    }
+                    if args.no_default_features.is_some() {
+                        command.arg("--no-default-features");
+                    }
+                    let mut child =
+                        command
+                            .env("RUSTC_BOOTSTRAP", "1")
+                            .env("RUSTC_WORKSPACE_WRAPPER", &exe)
+                            .env("CARGO_TARGET_DIR", &target)
+                            .env(WRAP_ENV, "1")
+                            .stdout(Stdio::piped())
+                            .spawn()
+                            .map_err(
+                                |e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e),
+                            )?;
+                    let stdout = child.stdout.take().ok_or_else(|| "cargo check gave no output".to_string())?;
+                    let mut found = vec![];
+                    let mut missing = false;
+                    for line in BufReader::new(stdout).lines() {
+                        let line = line.map_err(|e| format!("cannot read cargo check output: {}", e))?;
+                        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                            println!("{}", line);
+                            continue;
+                        };
+                        match message.get("reason").and_then(|v| v.as_str()) {
+                            Some("compiler-message") => {
+                                if let Some(rendered) =
+                                    message.pointer("/message/rendered").and_then(|v| v.as_str()) {
+                                    eprint!("{}", rendered);
+                                }
+                            },
+                            Some("compiler-artifact") => {
+                                let ours =
+                                    message
+                                        .get("package_id")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|id| member_ids.contains(id));
+                                if !ours {
+                                    continue;
+                                }
+                                let kept =
+                                    message
+                                        .get("filenames")
+                                        .and_then(|v| v.as_array())
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|v| v.as_str())
+                                        .find_map(|file| {
+                                            let file = Path::new(file);
+                                            let (_, hash) = file.file_stem()?.to_str()?.rsplit_once('-')?;
+                                            let at = file.parent()?.join(report_name(&format!("-{}", hash)));
+                                            return at.is_file().then_some(at);
+                                        });
+                                let Some(at) = kept else {
+                                    missing = true;
+                                    continue;
+                                };
+                                let text =
+                                    std::fs::read_to_string(
+                                        &at,
+                                    ).map_err(|e| format!("cannot read {}: {}", at.display(), e))?;
+                                found.push(
+                                    serde_json::from_str::<Report>(
+                                        &text,
+                                    ).map_err(|e| format!("cannot parse {}: {}", at.display(), e))?,
+                                );
+                            },
+                            _ => { },
+                        }
+                    }
+                    let status =
+                        child
+                            .wait()
+                            .map_err(
+                                |e| format!("failed to run cargo check in {}: {}", workspace_root.display(), e),
+                            )?;
+                    if !status.success() {
+                        return Err(
+                            format!(
+                                "{} does not compile for {}, so it cannot be checked; fix the build errors above first",
+                                workspace_root.display(),
+                                group_target.as_deref().unwrap_or("the default target")
+                            ),
+                        );
+                    }
+                    if !missing {
+                        reports.extend(found);
+                        break;
+                    }
+                    if cleared {
+                        return Err(
+                            format!(
+                                "cargo built crates without reporting on them even from a clean start; remove {} and try again",
+                                target.display()
+                            ),
+                        );
+                    }
+                    cleared = true;
+                    clear_members(&target, &names, 0);
                 }
             }
         }
@@ -833,28 +933,10 @@ fn main() {
                 return real.starts_with(&real_repo) && !build_dirs.iter().any(|dir| real.starts_with(dir));
             });
         };
-        let entries = std::fs::read_dir(&out_dir).map_err(|e| format!("cannot read {}: {}", out_dir.display(), e))?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension() != Some(OsStr::new("json")) {
-                continue;
-            }
-            let text =
-                std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
-            let report: Report =
-                serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {}", path.display(), e))?;
+        for report in reports {
             problems.extend(report.problems.into_iter().filter(|problem| return ours(&problem.path)));
             defs.extend(report.defs);
             uses.extend(report.uses);
-        }
-        let _ = std::fs::remove_dir_all(&out_dir);
-        if defs.is_empty() {
-            return Err(
-                format!(
-                    "no crate reported anything, which means cargo reused old build output; remove {} and try again",
-                    root.join("target").join("rust-ai-lint").display()
-                ),
-            );
         }
         let mut sites: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut written: HashMap<String, BTreeSet<String>> = HashMap::new();

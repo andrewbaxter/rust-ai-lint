@@ -14,17 +14,14 @@ use {
         },
         wire::{
             Def,
-            OUT_DIR_ENV,
             Problem,
             Report,
+            report_name,
         },
     },
     rustc_hir::def::DefKind,
     rustc_middle::ty::TyCtxt,
-    std::{
-        path::PathBuf,
-        process::exit,
-    },
+    std::process::exit,
 };
 
 pub struct Callbacks;
@@ -306,16 +303,17 @@ impl rustc_driver::Callbacks for Callbacks {
             };
             tcx.hir_visit_all_item_likes_in_crate(&mut walk);
         }
-        if let Some(dir) = std::env::var_os(OUT_DIR_ENV) {
-            let name = format!("{}-{}.json", tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE), std::process::id());
-            let at = PathBuf::from(dir).join(&name);
-            let written = serde_json::to_string(&report).map_err(|e| e.to_string()).and_then(|text| {
-                return std::fs::write(&at, text).map_err(|e| e.to_string());
-            });
-            if let Err(e) = written {
-                println!("rust-ai-lint: cannot write findings to {}: {}", at.display(), e);
-                exit(1);
-            }
+        let Some(dir) = &tcx.sess.io.output_dir else {
+            println!("rust-ai-lint: rustc was given no --out-dir to keep findings in");
+            exit(1);
+        };
+        let at = dir.join(report_name(&tcx.sess.opts.cg.extra_filename));
+        let written = serde_json::to_string(&report).map_err(|e| e.to_string()).and_then(|text| {
+            return std::fs::write(&at, text).map_err(|e| e.to_string());
+        });
+        if let Err(e) = written {
+            println!("rust-ai-lint: cannot write findings to {}: {}", at.display(), e);
+            exit(1);
         }
         return rustc_driver::Compilation::Continue;
     }
