@@ -865,9 +865,13 @@ fn main() {
                                         .filter_map(|v| v.as_str())
                                         .find_map(|file| {
                                             let file = Path::new(file);
-                                            let (_, hash) = file.file_stem()?.to_str()?.rsplit_once('-')?;
-                                            let at = file.parent()?.join(report_name(&format!("-{}", hash)));
-                                            return at.is_file().then_some(at);
+                                            let dir = file.parent()?;
+                                            return [file.file_stem(), dir.file_name()]
+                                                .into_iter()
+                                                .flatten()
+                                                .filter_map(|name| Some(name.to_str()?.rsplit_once('-')?.1))
+                                                .map(|hash| dir.join(report_name(&format!("-{}", hash))))
+                                                .find(|at| at.is_file());
                                         });
                                 let Some(at) = kept else {
                                     missing = true;
