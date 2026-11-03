@@ -292,6 +292,11 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
 
     fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, id: HirId) {
         self.record_res(path.res, path.span, id);
+        if let Some((_, parents)) = path.segments.split_last() {
+            for segment in parents {
+                self.record_res(segment.res, segment.ident.span, id);
+            }
+        }
         rustc_hir::intravisit::walk_path(self, path);
     }
 
