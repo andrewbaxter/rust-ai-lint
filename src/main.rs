@@ -710,7 +710,7 @@ fn main() {
             return Ok(report(problems, &root));
         }
         let mut workspaces: BTreeMap<PathBuf, BTreeMap<String, BTreeSet<Option<String>>>> = BTreeMap::new();
-        let mut member_ids = BTreeSet::new();
+        let mut member_ids: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
         for manifest in manifests {
             let out =
                 Command::new(cargo())
@@ -737,12 +737,13 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| format!("cargo metadata in {} has no workspace_root", manifest.display()))?;
             let mut members = BTreeMap::new();
+            let ids = member_ids.entry(PathBuf::from(workspace_root)).or_default();
             for package in meta.get("packages").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
                 let Some(name) = package.get("name").and_then(|v| v.as_str()) else {
                     continue;
                 };
                 if let Some(id) = package.get("id").and_then(|v| v.as_str()) {
-                    member_ids.insert(id.to_string());
+                    ids.insert(id.to_string());
                 }
                 let mut targets = BTreeSet::new();
                 let mut native = true;
@@ -783,6 +784,7 @@ fn main() {
         for (workspace_root, members) in &workspaces {
             let target = workspace_root.join("target").join("rust-ai-lint");
             let names = members.keys().cloned().collect();
+            let ids = &member_ids[workspace_root];
             let stamp = target.join("built-by");
             if std::fs::read_to_string(&stamp).ok().as_deref() != Some(built_by.as_str()) {
                 clear_members(&target, &names, 0);
@@ -823,6 +825,7 @@ fn main() {
                     let mut child =
                         command
                             .env("RUSTC_BOOTSTRAP", "1")
+                            .env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "stable")
                             .env("RUSTC_WORKSPACE_WRAPPER", &exe)
                             .env("CARGO_TARGET_DIR", &target)
                             .env(WRAP_ENV, "1")
@@ -852,7 +855,7 @@ fn main() {
                                     message
                                         .get("package_id")
                                         .and_then(|v| v.as_str())
-                                        .is_some_and(|id| member_ids.contains(id));
+                                        .is_some_and(|id| ids.contains(id));
                                 if !ours {
                                     continue;
                                 }
