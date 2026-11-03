@@ -11,7 +11,10 @@ use {
             DefKind,
             Res,
         },
-        def_id::DefId,
+        def_id::{
+            DefId,
+            LocalDefId,
+        },
         intravisit::Visitor,
     },
     rustc_middle::ty::{
@@ -23,10 +26,16 @@ use {
             NoVisibleGuard,
         },
     },
-    rustc_span::Span,
-    std::path::{
-        Component,
-        PathBuf,
+    rustc_span::{
+        Span,
+        Symbol,
+    },
+    std::{
+        collections::HashMap,
+        path::{
+            Component,
+            PathBuf,
+        },
     },
 };
 
@@ -79,6 +88,7 @@ pub fn place(tcx: TyCtxt<'_>, span: Span) -> Option<(String, usize, usize)> {
 
 pub struct Walk<'a, 'tcx> {
     pub generated: bool,
+    pub imports: HashMap<(LocalDefId, Symbol), Vec<(DefId, Vec<Res>)>>,
     pub in_const_arg: usize,
     pub in_or_pattern: usize,
     pub report: &'a mut Report,
@@ -116,6 +126,38 @@ impl<'a, 'tcx> Walk<'a, 'tcx> {
         self.record(key, span, at);
     }
 
+    fn record_imports(&mut self, segments: &[rustc_hir::PathSegment<'tcx>], last: &[Res], at: HirId) {
+        let here = self.tcx.parent_module(at).to_local_def_id();
+        for (index, segment) in segments.iter().enumerate() {
+            let module = match index {
+                0 => here,
+                _ => match segments[index - 1].res {
+                    Res::Def(DefKind::Mod, module) => match module.as_local() {
+                        Some(module) => module,
+                        None => continue,
+                    },
+                    _ => continue,
+                },
+            };
+            let Some(candidates) = self.imports.get(&(module, segment.ident.name)) else {
+                continue;
+            };
+            let mut reached = vec![segment.res];
+            if index + 1 == segments.len() {
+                reached.extend_from_slice(last);
+            }
+            let through =
+                candidates
+                    .iter()
+                    .filter(|(_, targets)| targets.iter().any(|target| reached.contains(target)))
+                    .map(|(import, _)| *import)
+                    .collect::<Vec<_>>();
+            for import in through {
+                self.record_def(import, segment.ident.span, at);
+            }
+        }
+    }
+
     fn record_res(&mut self, res: Res, span: Span, at: HirId) {
         match res {
             Res::Def(_, def_id) => self.record_def(def_id, span, at),
@@ -133,6 +175,14 @@ impl<'a, 'tcx> Walk<'a, 'tcx> {
             },
             _ => { },
         }
+    }
+
+    fn typeck(&self, at: HirId) -> Option<&'tcx rustc_middle::ty::TypeckResults<'tcx>> {
+        let root = self.tcx.typeck_root_def_id(at.owner.to_def_id()).as_local()?;
+        if self.tcx.hir_maybe_body_owned_by(root).is_none() {
+            return None;
+        }
+        return Some(self.tcx.typeck(root));
     }
 
     fn untyped(&mut self, span: Span, what: &str) {
@@ -171,15 +221,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        let owner = expr.hir_id.owner.def_id;
-        let typeck = (|| {
-            let root = self.tcx.typeck_root_def_id(owner.to_def_id()).as_local()?;
-            if self.tcx.hir_maybe_body_owned_by(root).is_none() {
-                return None;
-            }
-            return Some(self.tcx.typeck(root));
-        })();
-        let Some(typeck) = typeck else {
+        let Some(typeck) = self.typeck(expr.hir_id) else {
             if self.in_const_arg == 0 {
                 self.untyped(expr.span, "an expression");
             }
@@ -212,24 +254,22 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                 }
             },
             rustc_hir::ExprKind::Field(receiver, ident) => {
+                let written = match self.tcx.parent_hir_node(expr.hir_id) {
+                    rustc_hir::Node::Expr(
+                        rustc_hir::Expr { kind: rustc_hir::ExprKind::Assign(target, ..), .. },
+                    ) => target.hir_id ==
+                        expr.hir_id,
+                    _ => false,
+                };
+                if written {
+                    rustc_hir::intravisit::walk_expr(self, expr);
+                    return;
+                }
                 let receiver_ty = typeck.expr_ty(receiver);
                 if let rustc_middle::ty::Adt(adt, _) = receiver_ty.peel_refs().kind() {
                     let index = typeck.field_index(expr.hir_id);
                     if let Some(field) = adt.non_enum_variant().fields.get(index) {
                         self.record_def(field.did, ident.span, expr.hir_id);
-                    }
-                }
-            },
-            rustc_hir::ExprKind::Struct(qpath, fields, _) => {
-                let res = typeck.qpath_res(qpath, expr.hir_id);
-                let struct_ty = typeck.expr_ty(expr);
-                if let rustc_middle::ty::Adt(adt, _) = struct_ty.peel_refs().kind() {
-                    let variant = adt.variant_of_res(res);
-                    for field in fields {
-                        let index = typeck.field_index(field.hir_id);
-                        if let Some(field_def) = variant.fields.get(index) {
-                            self.record_def(field_def.did, field.ident.span, field.hir_id);
-                        }
                     }
                 }
             },
@@ -246,7 +286,9 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
     }
 
     fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) {
-        if matches!(item.kind, rustc_hir::ItemKind::Use(..)) {
+        if let rustc_hir::ItemKind::Use(path, _) = item.kind {
+            let last = path.res.present_items().collect::<Vec<_>>();
+            self.record_imports(path.segments, &last, item.hir_id());
             return;
         }
         let previous = self.generated;
@@ -267,6 +309,47 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                 }
             }
             return;
+        }
+        let read = match pat.kind {
+            rustc_hir::PatKind::Struct(qpath, fields, _) => Some(
+                (
+                    qpath,
+                    fields
+                        .iter()
+                        .map(|field| (Some(field.hir_id), field.pat, field.ident.span))
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+            rustc_hir::PatKind::TupleStruct(qpath, positional, _) => Some(
+                (qpath, positional.iter().map(|inner| (None, inner, inner.span)).collect()),
+            ),
+            _ => None,
+        };
+        if let (Some((qpath, fields)), Some(typeck)) = (read, self.typeck(pat.hir_id)) {
+            let res = typeck.qpath_res(&qpath, pat.hir_id);
+            if let rustc_middle::ty::Adt(adt, _) = typeck.pat_ty(pat).peel_refs().kind() {
+                let variant = adt.variant_of_res(res);
+                let rest = match pat.kind {
+                    rustc_hir::PatKind::TupleStruct(_, _, rest) => rest.as_opt_usize(),
+                    _ => None,
+                };
+                let count = fields.len();
+                for (position, (field_id, inner, span)) in fields.into_iter().enumerate() {
+                    if matches!(inner.kind, rustc_hir::PatKind::Wild) {
+                        continue;
+                    }
+                    let index = match field_id {
+                        Some(field_id) => typeck.field_index(field_id).as_usize(),
+                        None => match rest {
+                            Some(rest) if position >= rest => variant.fields.len() - (count - position),
+                            _ => position,
+                        },
+                    };
+                    if let Some(field_def) = variant.fields.iter().nth(index) {
+                        self.record_def(field_def.did, span, pat.hir_id);
+                    }
+                }
+            }
         }
         if let rustc_hir::PatKind::Binding(_, _, ident, _) = pat.kind {
             if !ident.span.from_expansion() && self.in_or_pattern == 0 {
@@ -292,6 +375,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
 
     fn visit_path(&mut self, path: &rustc_hir::Path<'tcx>, id: HirId) {
         self.record_res(path.res, path.span, id);
+        self.record_imports(path.segments, &[path.res], id);
         if let Some((_, parents)) = path.segments.split_last() {
             for segment in parents {
                 self.record_res(segment.res, segment.ident.span, id);

@@ -781,6 +781,7 @@ fn main() {
             false => "--message-format=json",
         };
         let mut reports: Vec<Report> = vec![];
+        let mut warnings: Vec<Problem> = vec![];
         for (workspace_root, members) in &workspaces {
             let target = workspace_root.join("target").join("rust-ai-lint");
             let names = members.keys().cloned().collect();
@@ -836,6 +837,7 @@ fn main() {
                             )?;
                     let stdout = child.stdout.take().ok_or_else(|| "cargo check gave no output".to_string())?;
                     let mut found = vec![];
+                    let mut warned = vec![];
                     let mut missing = false;
                     for line in BufReader::new(stdout).lines() {
                         let line = line.map_err(|e| format!("cannot read cargo check output: {}", e))?;
@@ -849,6 +851,32 @@ fn main() {
                                     message.pointer("/message/rendered").and_then(|v| v.as_str()) {
                                     eprint!("{}", rendered);
                                 }
+                                if message.pointer("/message/level").and_then(|v| v.as_str()) != Some("warning") {
+                                    continue;
+                                }
+                                let primary =
+                                    message
+                                        .pointer("/message/spans")
+                                        .and_then(|v| v.as_array())
+                                        .into_iter()
+                                        .flatten()
+                                        .find(
+                                            |span| span.get("is_primary").and_then(|v| v.as_bool()) == Some(true),
+                                        );
+                                let Some(primary) = primary else {
+                                    continue;
+                                };
+                                let Some(file) = primary.get("file_name").and_then(|v| v.as_str()) else {
+                                    continue;
+                                };
+                                let text =
+                                    message.pointer("/message/message").and_then(|v| v.as_str()).unwrap_or("");
+                                warned.push(Problem {
+                                    check: "warnings".to_string(),
+                                    path: workspace_root.join(file).display().to_string(),
+                                    line: primary.get("line_start").and_then(|v| v.as_u64()).unwrap_or(1) as usize,
+                                    message: format!("{}; fix the compiler warning", text),
+                                });
                             },
                             Some("compiler-artifact") => {
                                 let ours =
@@ -910,6 +938,7 @@ fn main() {
                     }
                     if !missing {
                         reports.extend(found);
+                        warnings.extend(warned);
                         break;
                     }
                     if cleared {
@@ -940,6 +969,7 @@ fn main() {
                 return real.starts_with(&real_repo) && !build_dirs.iter().any(|dir| real.starts_with(dir));
             });
         };
+        problems.extend(warnings.into_iter().filter(|problem| return ours(&problem.path)));
         for report in reports {
             problems.extend(report.problems.into_iter().filter(|problem| return ours(&problem.path)));
             defs.extend(report.defs);

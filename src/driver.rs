@@ -21,7 +21,10 @@ use {
     },
     rustc_hir::def::DefKind,
     rustc_middle::ty::TyCtxt,
-    std::process::exit,
+    std::{
+        collections::HashMap,
+        process::exit,
+    },
 };
 
 pub struct Callbacks;
@@ -38,7 +41,7 @@ impl rustc_driver::Callbacks for Callbacks {
                 tcx: tcx,
                 report: &mut report,
             };
-            for def_id in tcx.hir_crate_items(()).definitions() {
+            for def_id in tcx.iter_local_def_id() {
                 let kind = tcx.def_kind(def_id);
                 let Some(name) = tcx.opt_item_name(def_id.to_def_id()) else {
                     continue;
@@ -46,6 +49,9 @@ impl rustc_driver::Callbacks for Callbacks {
                 let Some(span) = tcx.def_ident_span(def_id.to_def_id()) else {
                     continue;
                 };
+                if span.from_expansion() {
+                    continue;
+                }
                 let name = name.to_string();
                 let name = name.strip_prefix("r#").unwrap_or(&name).to_string();
                 match kind {
@@ -60,7 +66,19 @@ impl rustc_driver::Callbacks for Callbacks {
                         checker.name(span, &name, "variant", "UpperCamelCase", is_upper_camel(&name))
                     },
                     DefKind::TyParam => {
-                        checker.name(span, &name, "type parameter", "UpperCamelCase", is_upper_camel(&name))
+                        let synthetic =
+                            matches!(
+                                tcx.hir_node_by_def_id(def_id),
+                                rustc_hir::Node::GenericParam(
+                                    rustc_hir::GenericParam {
+                                        kind: rustc_hir::GenericParamKind::Type { synthetic: true, .. },
+                                        ..
+                                    }
+                                )
+                            );
+                        if !synthetic {
+                            checker.name(span, &name, "type parameter", "UpperCamelCase", is_upper_camel(&name))
+                        }
                     },
                     DefKind::Fn => checker.name(span, &name, "function", "snake_case", is_snake(&name)),
                     DefKind::AssocFn => checker.name(span, &name, "method", "snake_case", is_snake(&name)),
@@ -82,7 +100,8 @@ impl rustc_driver::Callbacks for Callbacks {
             tcx.hir_visit_all_item_likes_in_crate(&mut checker);
         }
         let map = tcx.sess.source_map();
-        for def_id in tcx.hir_crate_items(()).definitions() {
+        for def_id in tcx.iter_local_def_id() {
+            #[allow(deprecated)]
             for attr in tcx.get_all_attrs(def_id.to_def_id()) {
                 if !matches!(attr, rustc_hir::Attribute::Unparsed(..)) {
                     continue;
@@ -202,7 +221,9 @@ impl rustc_driver::Callbacks for Callbacks {
             });
         }
         if !tcx.sess.opts.test {
-            for def_id in tcx.hir_crate_items(()).definitions() {
+            let executable_only =
+                tcx.crate_types().iter().all(|kind| *kind == rustc_session::config::CrateType::Executable);
+            for def_id in tcx.iter_local_def_id() {
                 let kind = tcx.def_kind(def_id);
                 let described = match kind {
                     DefKind::Fn => "function",
@@ -234,6 +255,7 @@ impl rustc_driver::Callbacks for Callbacks {
                     if tcx.entry_fn(()).map(|(entry, _)| entry == def_id.to_def_id()).unwrap_or(false) {
                         return true;
                     }
+                    #[allow(deprecated)]
                     for attr in tcx.get_all_attrs(def_id.to_def_id()) {
                         let Some(attr_name) = attr.name() else {
                             continue;
@@ -262,7 +284,7 @@ impl rustc_driver::Callbacks for Callbacks {
                             return true;
                         }
                     }
-                    return tcx.effective_visibilities(()).is_exported(def_id);
+                    return !executable_only && tcx.effective_visibilities(()).is_exported(def_id);
                 })();
                 let (inlinable, movable) = match kind {
                     DefKind::Fn | DefKind::AssocFn | DefKind::Const { .. } | DefKind::AssocConst { .. } => (
@@ -292,10 +314,64 @@ impl rustc_driver::Callbacks for Callbacks {
                     movable: movable,
                 });
             }
+            for item_id in tcx.hir_crate_items(()).free_items().filter(|_| executable_only) {
+                let item = tcx.hir_item(item_id);
+                let rustc_hir::ItemKind::Use(path, rustc_hir::UseKind::Single(ident)) = item.kind else {
+                    continue;
+                };
+                if item.span.from_expansion() || ident.name.as_str().starts_with('_') {
+                    continue;
+                }
+                if !tcx.effective_visibilities(()).is_exported(item.owner_id.def_id) {
+                    continue;
+                }
+                let unreachable_by_path =
+                    path
+                        .res
+                        .present_items()
+                        .any(
+                            |res| matches!(
+                                res,
+                                rustc_hir::def::Res::Def(DefKind::Trait | DefKind::TraitAlias | DefKind::Macro(..), _)
+                            ),
+                        );
+                if unreachable_by_path {
+                    continue;
+                }
+                let Some((path, line, _)) = place(tcx, ident.span) else {
+                    continue;
+                };
+                report.defs.push(Def {
+                    key: def_key(tcx, item.owner_id.to_def_id()),
+                    kind: "public import".to_string(),
+                    name: ident.name.to_string(),
+                    path: path,
+                    line: line,
+                    exempt: false,
+                    inlinable: false,
+                    movable: false,
+                });
+            }
         }
         {
+            let mut imports = HashMap::<_, Vec<_>>::new();
+            for item_id in tcx.hir_crate_items(()).free_items() {
+                let item = tcx.hir_item(item_id);
+                let rustc_hir::ItemKind::Use(path, rustc_hir::UseKind::Single(ident)) = item.kind else {
+                    continue;
+                };
+                if !tcx.effective_visibilities(()).is_exported(item.owner_id.def_id) {
+                    continue;
+                }
+                let module = tcx.parent_module_from_def_id(item.owner_id.def_id).to_local_def_id();
+                imports
+                    .entry((module, ident.name))
+                    .or_default()
+                    .push((item.owner_id.to_def_id(), path.res.present_items().collect()));
+            }
             let mut walk = Walk {
                 tcx: tcx,
+                imports: imports,
                 report: &mut report,
                 in_or_pattern: 0,
                 in_const_arg: 0,
