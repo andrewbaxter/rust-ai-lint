@@ -265,7 +265,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Walk<'a, 'tcx> {
                     rustc_hir::intravisit::walk_expr(self, expr);
                     return;
                 }
-                let receiver_ty = typeck.expr_ty(receiver);
+                let receiver_ty = typeck.expr_ty_adjusted(receiver);
                 if let rustc_middle::ty::Adt(adt, _) = receiver_ty.peel_refs().kind() {
                     let index = typeck.field_index(expr.hir_id);
                     if let Some(field) = adt.non_enum_variant().fields.get(index) {
